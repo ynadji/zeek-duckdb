@@ -6,14 +6,14 @@ namespace duckdb {
 
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	
+
 	while (state.current_file_idx < bind_data.file_paths.size()) {
 		state.current_file_path = bind_data.file_paths[state.current_file_idx];
 		state.current_file_idx++;
-		
-		state.file_handle = fs.OpenFile(state.current_file_path, 
-		                                 FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
-		
+
+		state.file_handle =
+		    fs.OpenFile(state.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+
 		string line;
 		idx_t lines_to_skip = bind_data.header.header_line_count;
 		for (idx_t i = 0; i < lines_to_skip; i++) {
@@ -27,18 +27,18 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, con
 }
 
 static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<ZeekScanBindData>();
 	string pattern = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	
+
 	auto glob_result = fs.GlobFiles(pattern, context, FileGlobOptions::DISALLOW_EMPTY);
 	for (auto &file_info : glob_result) {
 		result->file_paths.push_back(file_info.path);
 	}
 	std::sort(result->file_paths.begin(), result->file_paths.end());
-	
+
 	if (result->file_paths.empty()) {
 		throw IOException("No files found matching pattern: %s", pattern);
 	}
@@ -48,8 +48,8 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		result->filename_column = filename_param->second.GetValue<bool>();
 	}
 
-	auto file_handle = fs.OpenFile(result->file_paths[0], 
-	                                FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+	auto file_handle =
+	    fs.OpenFile(result->file_paths[0], FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 	result->header = ZeekReader::ParseHeader(*file_handle);
 
 	for (idx_t i = 0; i < result->header.fields.size(); i++) {
@@ -67,8 +67,7 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ZeekScanBindData>();
 	auto result = make_uniq<ZeekScanGlobalState>();
 
@@ -109,7 +108,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 		for (idx_t col_idx = 0; col_idx < data_col_count; col_idx++) {
 			auto &vec = output.data[col_idx];
-			
+
 			if (col_idx >= fields.size()) {
 				FlatVector::SetNull(vec, row_count, true);
 				continue;
@@ -117,8 +116,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			const string &field_value = fields[col_idx];
 
-			if (field_value == bind_data.header.unset_field ||
-			    field_value == bind_data.header.empty_field) {
+			if (field_value == bind_data.header.unset_field || field_value == bind_data.header.empty_field) {
 				FlatVector::SetNull(vec, row_count, true);
 				continue;
 			}
@@ -163,8 +161,8 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 		if (bind_data.filename_column) {
 			auto &filename_vec = output.data[data_col_count];
-			FlatVector::GetData<string_t>(filename_vec)[row_count] = 
-				StringVector::AddString(filename_vec, state.current_file_path);
+			FlatVector::GetData<string_t>(filename_vec)[row_count] =
+			    StringVector::AddString(filename_vec, state.current_file_path);
 		}
 
 		row_count++;
@@ -179,4 +177,4 @@ TableFunction GetZeekScanFunction() {
 	return func;
 }
 
-}
+} // namespace duckdb

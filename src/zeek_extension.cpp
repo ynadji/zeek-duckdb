@@ -4,7 +4,6 @@
 #include "zeek_reader.hpp"
 #include "duckdb.hpp"
 
-
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -27,7 +26,7 @@ std::string ZeekExtension::Version() const {
 #endif
 }
 
-}
+} // namespace duckdb
 
 extern "C" {
 

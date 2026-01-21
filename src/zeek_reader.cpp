@@ -120,8 +120,8 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
 		return LogicalType::BIGINT;
 	} else if (zeek_type == "bool") {
 		return LogicalType::BOOLEAN;
-	} else if (zeek_type == "string" || zeek_type == "addr" || zeek_type == "subnet" ||
-	           zeek_type == "port" || zeek_type == "enum") {
+	} else if (zeek_type == "string" || zeek_type == "addr" || zeek_type == "subnet" || zeek_type == "port" ||
+	           zeek_type == "enum") {
 		return LogicalType::VARCHAR;
 	} else if (StringUtil::StartsWith(zeek_type, "vector[") || StringUtil::StartsWith(zeek_type, "set[")) {
 		return LogicalType::VARCHAR;
