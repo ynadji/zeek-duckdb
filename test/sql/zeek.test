@@ -1,0 +1,35 @@
+# name: test/sql/zeek.test
+# description: test zeek extension
+# group: [sql]
+
+require zeek
+
+# Test basic read from gzipped file
+query IIIII
+SELECT ts, kuid, host_ip, conns_opened, conns_closed FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+1768540789.230929	Kfoql5dpOG1K1	70.21.7.136	1	1
+
+# Test count
+query I
+SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+1
+
+# Test NULL handling for unset field (-)
+query I
+SELECT host_inner_vlan IS NULL FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+true
+
+# Test NULL handling for empty field ((empty))
+query I
+SELECT annotations IS NULL FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+true
+
+# Test column types
+query IIIII
+SELECT typeof(ts), typeof(duration), typeof(host_vlan), typeof(conns_opened), typeof(kuid) FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+DOUBLE	DOUBLE	BIGINT	UBIGINT	VARCHAR
