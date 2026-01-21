@@ -33,3 +33,21 @@ query IIIII
 SELECT typeof(ts), typeof(duration), typeof(host_vlan), typeof(conns_opened), typeof(kuid) FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
 ----
 DOUBLE	DOUBLE	BIGINT	UBIGINT	VARCHAR
+
+# Test glob pattern - read all files
+query I
+SELECT COUNT(*) FROM read_zeek('data/*.gz');
+----
+27
+
+# Test glob pattern with filename column
+query I
+SELECT COUNT(DISTINCT filename) FROM read_zeek('data/*.gz', filename=true);
+----
+24
+
+# Test filename column content
+query I
+SELECT filename FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz', filename=true);
+----
+data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz

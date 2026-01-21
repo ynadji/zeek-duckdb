@@ -4,14 +4,52 @@
 
 namespace duckdb {
 
+static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	
+	while (state.current_file_idx < bind_data.file_paths.size()) {
+		state.current_file_path = bind_data.file_paths[state.current_file_idx];
+		state.current_file_idx++;
+		
+		state.file_handle = fs.OpenFile(state.current_file_path, 
+		                                 FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+		
+		string line;
+		idx_t lines_to_skip = bind_data.header.header_line_count;
+		for (idx_t i = 0; i < lines_to_skip; i++) {
+			if (!ZeekReader::ReadLine(*state.file_handle, line)) {
+				break;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<ZeekScanBindData>();
-	result->file_path = input.inputs[0].GetValue<string>();
+	string pattern = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto file_handle = fs.OpenFile(result->file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+	
+	auto glob_result = fs.GlobFiles(pattern, context, FileGlobOptions::DISALLOW_EMPTY);
+	for (auto &file_info : glob_result) {
+		result->file_paths.push_back(file_info.path);
+	}
+	std::sort(result->file_paths.begin(), result->file_paths.end());
+	
+	if (result->file_paths.empty()) {
+		throw IOException("No files found matching pattern: %s", pattern);
+	}
 
+	auto filename_param = input.named_parameters.find("filename");
+	if (filename_param != input.named_parameters.end()) {
+		result->filename_column = filename_param->second.GetValue<bool>();
+	}
+
+	auto file_handle = fs.OpenFile(result->file_paths[0], 
+	                                FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 	result->header = ZeekReader::ParseHeader(*file_handle);
 
 	for (idx_t i = 0; i < result->header.fields.size(); i++) {
@@ -19,6 +57,11 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i]);
 		return_types.push_back(col_type);
 		result->column_types.push_back(col_type);
+	}
+
+	if (result->filename_column) {
+		names.push_back("filename");
+		return_types.push_back(LogicalType::VARCHAR);
 	}
 
 	return std::move(result);
@@ -29,15 +72,8 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 	auto &bind_data = input.bind_data->Cast<ZeekScanBindData>();
 	auto result = make_uniq<ZeekScanGlobalState>();
 
-	auto &fs = FileSystem::GetFileSystem(context);
-	result->file_handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
-
-	string line;
-	for (idx_t i = 0; i < bind_data.header.header_line_count; i++) {
-		if (!ZeekReader::ReadLine(*result->file_handle, line)) {
-			result->finished = true;
-			break;
-		}
+	if (!OpenNextFile(context, *result, bind_data)) {
+		result->finished = true;
 	}
 
 	return std::move(result);
@@ -45,20 +81,24 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 
 static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<ZeekScanBindData>();
-	auto &global_state = data.global_state->Cast<ZeekScanGlobalState>();
+	auto &state = data.global_state->Cast<ZeekScanGlobalState>();
 
-	if (global_state.finished) {
+	if (state.finished) {
 		output.SetCardinality(0);
 		return;
 	}
 
 	idx_t row_count = 0;
 	string line;
+	idx_t data_col_count = bind_data.column_types.size();
 
 	while (row_count < STANDARD_VECTOR_SIZE) {
-		if (!ZeekReader::ReadLine(*global_state.file_handle, line)) {
-			global_state.finished = true;
-			break;
+		if (!ZeekReader::ReadLine(*state.file_handle, line)) {
+			if (!OpenNextFile(context, state, bind_data)) {
+				state.finished = true;
+				break;
+			}
+			continue;
 		}
 
 		if (line.empty() || line[0] == '#') {
@@ -67,11 +107,11 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 		vector<string> fields = StringUtil::Split(line, bind_data.header.separator);
 
-		for (idx_t col_idx = 0; col_idx < bind_data.column_types.size(); col_idx++) {
-			auto &vector = output.data[col_idx];
+		for (idx_t col_idx = 0; col_idx < data_col_count; col_idx++) {
+			auto &vec = output.data[col_idx];
 			
 			if (col_idx >= fields.size()) {
-				FlatVector::SetNull(vector, row_count, true);
+				FlatVector::SetNull(vec, row_count, true);
 				continue;
 			}
 
@@ -79,7 +119,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			if (field_value == bind_data.header.unset_field ||
 			    field_value == bind_data.header.empty_field) {
-				FlatVector::SetNull(vector, row_count, true);
+				FlatVector::SetNull(vec, row_count, true);
 				continue;
 			}
 
@@ -87,38 +127,44 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			switch (type_id) {
 			case LogicalTypeId::DOUBLE: {
 				try {
-					FlatVector::GetData<double>(vector)[row_count] = std::stod(field_value);
+					FlatVector::GetData<double>(vec)[row_count] = std::stod(field_value);
 				} catch (...) {
-					FlatVector::SetNull(vector, row_count, true);
+					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::UBIGINT: {
 				try {
-					FlatVector::GetData<uint64_t>(vector)[row_count] = std::stoull(field_value);
+					FlatVector::GetData<uint64_t>(vec)[row_count] = std::stoull(field_value);
 				} catch (...) {
-					FlatVector::SetNull(vector, row_count, true);
+					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::BIGINT: {
 				try {
-					FlatVector::GetData<int64_t>(vector)[row_count] = std::stoll(field_value);
+					FlatVector::GetData<int64_t>(vec)[row_count] = std::stoll(field_value);
 				} catch (...) {
-					FlatVector::SetNull(vector, row_count, true);
+					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::BOOLEAN: {
-				FlatVector::GetData<bool>(vector)[row_count] = (field_value == "T" || field_value == "true");
+				FlatVector::GetData<bool>(vec)[row_count] = (field_value == "T" || field_value == "true");
 				break;
 			}
 			case LogicalTypeId::VARCHAR:
 			default: {
-				FlatVector::GetData<string_t>(vector)[row_count] = StringVector::AddString(vector, field_value);
+				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, field_value);
 				break;
 			}
 			}
+		}
+
+		if (bind_data.filename_column) {
+			auto &filename_vec = output.data[data_col_count];
+			FlatVector::GetData<string_t>(filename_vec)[row_count] = 
+				StringVector::AddString(filename_vec, state.current_file_path);
 		}
 
 		row_count++;
@@ -129,6 +175,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 TableFunction GetZeekScanFunction() {
 	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal);
+	func.named_parameters["filename"] = LogicalType::BOOLEAN;
 	return func;
 }
 

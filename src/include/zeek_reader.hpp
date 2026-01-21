@@ -49,22 +49,28 @@ public:
 
 //! Bind data for the read_zeek table function
 struct ZeekScanBindData : public TableFunctionData {
-	//! Path to the Zeek log file
-	string file_path;
-	//! Parsed header information
+	//! List of file paths (expanded from glob)
+	vector<string> file_paths;
+	//! Parsed header information (from first file, used as schema)
 	ZeekHeader header;
 	//! DuckDB types for each column
 	vector<LogicalType> column_types;
+	//! Whether to add a filename column
+	bool filename_column = false;
 };
 
 //! Global state for the read_zeek table function
 struct ZeekScanGlobalState : public GlobalTableFunctionState {
+	//! Current file index
+	idx_t current_file_idx = 0;
 	//! File handle for reading
 	unique_ptr<FileHandle> file_handle;
-	//! Whether we've finished reading
+	//! Whether we've finished reading all files
 	bool finished = false;
 	//! Buffer for reading lines
 	string line_buffer;
+	//! Current file path (for filename column)
+	string current_file_path;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded for now
