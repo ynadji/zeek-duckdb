@@ -8,7 +8,7 @@ require zeek
 query IIIII
 SELECT ts, kuid, host_ip, conns_opened, conns_closed FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
 ----
-1768540789.230929	Kfoql5dpOG1K1	10.21.7.136	1	1
+2026-01-16 05:19:49.230929+00	Kfoql5dpOG1K1	10.21.7.136	1	1
 
 # Test count
 query I
@@ -22,11 +22,11 @@ SELECT host_inner_vlan IS NULL FROM read_zeek('data/known_hosts_20260116_00:00:0
 ----
 true
 
-# Test column types
+# Test column types - ts is now TIMESTAMP WITH TIME ZONE
 query IIIII
 SELECT typeof(ts), typeof(duration), typeof(host_vlan), typeof(conns_opened), typeof(kuid) FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
 ----
-DOUBLE	DOUBLE	BIGINT	UBIGINT	VARCHAR
+TIMESTAMP WITH TIME ZONE	DOUBLE	BIGINT	UBIGINT	VARCHAR
 
 # Test glob pattern - read all known_hosts files
 query I
@@ -69,3 +69,9 @@ query II
 SELECT typeof(annotations), typeof(TTLs) FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz'), read_zeek('data/dns.log.gz') LIMIT 1;
 ----
 VARCHAR[]	DOUBLE[]
+
+# Test timestamp extraction and comparison
+query I
+SELECT ts > '2026-01-01'::timestamptz FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
+----
+true

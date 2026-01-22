@@ -121,7 +121,9 @@ string ZeekReader::ExtractInnerType(const string &zeek_type) {
 }
 
 LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
-	if (zeek_type == "time" || zeek_type == "interval" || zeek_type == "double") {
+	if (zeek_type == "time") {
+		return LogicalType::TIMESTAMP_TZ;
+	} else if (zeek_type == "interval" || zeek_type == "double") {
 		return LogicalType::DOUBLE;
 	} else if (zeek_type == "count") {
 		return LogicalType::UBIGINT;

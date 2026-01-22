@@ -2,8 +2,14 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 namespace duckdb {
+
+static timestamp_tz_t EpochSecondsToTimestampTZ(double epoch_seconds) {
+	int64_t micros = static_cast<int64_t>(epoch_seconds * 1000000.0);
+	return timestamp_tz_t(micros);
+}
 
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -86,6 +92,14 @@ static void AppendListValue(Vector &vec, idx_t row_idx, const string &field_valu
 		}
 		case LogicalTypeId::BOOLEAN: {
 			FlatVector::GetData<bool>(child_vec)[child_idx] = (elem == "T" || elem == "true");
+			break;
+		}
+		case LogicalTypeId::TIMESTAMP_TZ: {
+			try {
+				FlatVector::GetData<timestamp_tz_t>(child_vec)[child_idx] = EpochSecondsToTimestampTZ(std::stod(elem));
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
 			break;
 		}
 		case LogicalTypeId::VARCHAR:
@@ -220,6 +234,15 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			}
 			case LogicalTypeId::BOOLEAN: {
 				FlatVector::GetData<bool>(vec)[row_count] = (field_value == "T" || field_value == "true");
+				break;
+			}
+			case LogicalTypeId::TIMESTAMP_TZ: {
+				try {
+					FlatVector::GetData<timestamp_tz_t>(vec)[row_count] =
+					    EpochSecondsToTimestampTZ(std::stod(field_value));
+				} catch (...) {
+					FlatVector::SetNull(vec, row_count, true);
+				}
 				break;
 			}
 			case LogicalTypeId::LIST: {
