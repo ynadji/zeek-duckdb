@@ -133,12 +133,22 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		result->filename_column = filename_param->second.GetValue<bool>();
 	}
 
+	bool replace_periods = true;
+	auto replace_periods_param = input.named_parameters.find("replace_periods");
+	if (replace_periods_param != input.named_parameters.end()) {
+		replace_periods = replace_periods_param->second.GetValue<bool>();
+	}
+
 	auto file_handle =
 	    fs.OpenFile(result->file_paths[0], FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 	result->header = ZeekReader::ParseHeader(*file_handle);
 
 	for (idx_t i = 0; i < result->header.fields.size(); i++) {
-		names.push_back(result->header.fields[i]);
+		string col_name = result->header.fields[i];
+		if (replace_periods) {
+			std::replace(col_name.begin(), col_name.end(), '.', '_');
+		}
+		names.push_back(col_name);
 		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i]);
 		return_types.push_back(col_type);
 		result->column_types.push_back(col_type);
@@ -274,6 +284,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 TableFunction GetZeekScanFunction() {
 	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal);
 	func.named_parameters["filename"] = LogicalType::BOOLEAN;
+	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
 	return func;
 }
 
