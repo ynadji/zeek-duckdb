@@ -111,6 +111,15 @@ ZeekHeader ZeekReader::ParseHeader(FileHandle &file_handle) {
 	return header;
 }
 
+string ZeekReader::ExtractInnerType(const string &zeek_type) {
+	auto bracket_start = zeek_type.find('[');
+	auto bracket_end = zeek_type.rfind(']');
+	if (bracket_start != string::npos && bracket_end != string::npos && bracket_end > bracket_start) {
+		return zeek_type.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+	}
+	return "string";
+}
+
 LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
 	if (zeek_type == "time" || zeek_type == "interval" || zeek_type == "double") {
 		return LogicalType::DOUBLE;
@@ -124,7 +133,9 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
 	           zeek_type == "enum") {
 		return LogicalType::VARCHAR;
 	} else if (StringUtil::StartsWith(zeek_type, "vector[") || StringUtil::StartsWith(zeek_type, "set[")) {
-		return LogicalType::VARCHAR;
+		string inner_type = ExtractInnerType(zeek_type);
+		LogicalType child_type = ZeekTypeToDuckDBType(inner_type);
+		return LogicalType::LIST(child_type);
 	}
 	return LogicalType::VARCHAR;
 }

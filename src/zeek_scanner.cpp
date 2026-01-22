@@ -1,6 +1,7 @@
 #include "zeek_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 namespace duckdb {
 
@@ -24,6 +25,76 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, con
 		return true;
 	}
 	return false;
+}
+
+static void AppendListValue(Vector &vec, idx_t row_idx, const string &field_value, char set_separator,
+                            const LogicalType &child_type, const string &unset_field, const string &empty_field) {
+	auto &list_entry = ListVector::GetData(vec)[row_idx];
+	auto current_size = ListVector::GetListSize(vec);
+
+	if (field_value == unset_field || field_value == empty_field) {
+		list_entry.offset = current_size;
+		list_entry.length = 0;
+		return;
+	}
+
+	vector<string> elements;
+	string sep_str(1, set_separator);
+	elements = StringUtil::Split(field_value, sep_str);
+
+	list_entry.offset = current_size;
+	list_entry.length = elements.size();
+
+	auto &child_vec = ListVector::GetEntry(vec);
+	ListVector::Reserve(vec, current_size + elements.size());
+	ListVector::SetListSize(vec, current_size + elements.size());
+
+	auto child_type_id = child_type.id();
+	for (idx_t i = 0; i < elements.size(); i++) {
+		idx_t child_idx = current_size + i;
+		const string &elem = elements[i];
+
+		if (elem == unset_field || elem == empty_field) {
+			FlatVector::SetNull(child_vec, child_idx, true);
+			continue;
+		}
+
+		switch (child_type_id) {
+		case LogicalTypeId::DOUBLE: {
+			try {
+				FlatVector::GetData<double>(child_vec)[child_idx] = std::stod(elem);
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
+			break;
+		}
+		case LogicalTypeId::UBIGINT: {
+			try {
+				FlatVector::GetData<uint64_t>(child_vec)[child_idx] = std::stoull(elem);
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
+			break;
+		}
+		case LogicalTypeId::BIGINT: {
+			try {
+				FlatVector::GetData<int64_t>(child_vec)[child_idx] = std::stoll(elem);
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
+			break;
+		}
+		case LogicalTypeId::BOOLEAN: {
+			FlatVector::GetData<bool>(child_vec)[child_idx] = (elem == "T" || elem == "true");
+			break;
+		}
+		case LogicalTypeId::VARCHAR:
+		default: {
+			FlatVector::GetData<string_t>(child_vec)[child_idx] = StringVector::AddString(child_vec, elem);
+			break;
+		}
+		}
+	}
 }
 
 static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFunctionBindInput &input,
@@ -149,6 +220,12 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			}
 			case LogicalTypeId::BOOLEAN: {
 				FlatVector::GetData<bool>(vec)[row_count] = (field_value == "T" || field_value == "true");
+				break;
+			}
+			case LogicalTypeId::LIST: {
+				auto &child_type = ListType::GetChildType(bind_data.column_types[col_idx]);
+				AppendListValue(vec, row_count, field_value, bind_data.header.set_separator, child_type,
+				                bind_data.header.unset_field, bind_data.header.empty_field);
 				break;
 			}
 			case LogicalTypeId::VARCHAR:

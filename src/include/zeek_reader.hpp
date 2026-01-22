@@ -38,13 +38,13 @@ public:
 	//! Returns the parsed header and positions the file handle at the first data line
 	static ZeekHeader ParseHeader(FileHandle &file_handle);
 
-	//! Convert a Zeek type string to a DuckDB LogicalType
 	static LogicalType ZeekTypeToDuckDBType(const string &zeek_type);
 
-	//! Parse escape sequences in separator strings (e.g., \x09 -> tab)
 	static string ParseSeparator(const string &sep_str);
 
 	static bool ReadLine(FileHandle &file_handle, string &line);
+
+	static string ExtractInnerType(const string &zeek_type);
 };
 
 //! Bind data for the read_zeek table function
