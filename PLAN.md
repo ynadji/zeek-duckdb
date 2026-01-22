@@ -27,7 +27,7 @@ Zeek logs are self-describing TSV files with metadata headers that define the sc
 #open	2026-01-16-00-30-32
 #fields	ts	duration	kuid	host_ip	host_vlan	host_inner_vlan	conns_opened	conns_closed	conns_pending	long_conns	annotations	last_active_session	last_active_interval
 #types	time	interval	string	addr	int	int	count	count	count	count	vector[string]	string	interval
-1768540789.230929	323.126660	Kfoql5dpOG1K1	70.21.7.136	1	-	1	1	0	0	(empty)	KfTpFzNjZ9k9h	3895.038597
+1768540789.230929	323.126660	Kfoql5dpOG1K1	10.21.7.136	1	-	1	1	0	0	(empty)	KfTpFzNjZ9k9h	3895.038597
 #close	2026-01-16-01-00-00
 ```
 
@@ -584,7 +584,7 @@ Once the extension is built, it can be loaded in DuckDB and used from Common Lis
 
 ;; Join with other data
 (ddb:query "CREATE TABLE threats (ip VARCHAR, severity INT)" nil)
-(ddb:query "INSERT INTO threats VALUES ('70.21.7.136', 9)" nil)
+(ddb:query "INSERT INTO threats VALUES ('10.21.7.136', 9)" nil)
 (ddb:query "SELECT z.*, t.severity
             FROM read_zeek('known_hosts.log.gz') z
             JOIN threats t ON z.host_ip = t.ip" nil)

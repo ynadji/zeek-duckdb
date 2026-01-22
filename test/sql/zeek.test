@@ -8,7 +8,7 @@ require zeek
 query IIIII
 SELECT ts, kuid, host_ip, conns_opened, conns_closed FROM read_zeek('data/known_hosts_20260116_00:00:00-01:00:00-0500.log.gz');
 ----
-1768540789.230929	Kfoql5dpOG1K1	70.21.7.136	1	1
+1768540789.230929	Kfoql5dpOG1K1	10.21.7.136	1	1
 
 # Test count
 query I
