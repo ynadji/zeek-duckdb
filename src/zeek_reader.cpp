@@ -141,10 +141,9 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type, bool use_i
 			try {
 				return TransformStringToLogicalType("INET", *context);
 			} catch (...) {
-				throw InvalidInputException(
-				    "Zeek type '%s' requires the inet extension. "
-				    "Run 'INSTALL inet; LOAD inet;' or use inet=false to read as VARCHAR.",
-				    zeek_type);
+				throw InvalidInputException("Zeek type '%s' requires the inet extension. "
+				                            "Run 'INSTALL inet; LOAD inet;' or use inet=false to read as VARCHAR.",
+				                            zeek_type);
 			}
 		}
 		return LogicalType::VARCHAR;
