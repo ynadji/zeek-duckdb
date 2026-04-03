@@ -13,19 +13,19 @@ A DuckDB extension for reading [Zeek](https://zeek.org/) (formerly Bro) network 
 
 | Zeek Type | DuckDB Type |
 |-----------|-------------|
-| `time` | `DOUBLE` |
-| `interval` | `DOUBLE` |
+| `time` | `TIMESTAMP WITH TIME ZONE` |
+| `interval` | `INTERVAL` |
 | `string` | `VARCHAR` |
-| `addr` | `VARCHAR` |
-| `subnet` | `VARCHAR` |
-| `port` | `VARCHAR` |
+| `addr` | `INET` (use `inet=false` for `VARCHAR`) |
+| `subnet` | `INET` (use `inet=false` for `VARCHAR`) |
+| `port` | `USMALLINT` |
 | `count` | `UBIGINT` |
 | `int` | `BIGINT` |
 | `bool` | `BOOLEAN` |
 | `double` | `DOUBLE` |
 | `enum` | `VARCHAR` |
-| `vector[T]` | `VARCHAR` |
-| `set[T]` | `VARCHAR` |
+| `vector[T]` | `LIST[T]` |
+| `set[T]` | `LIST[T]` |
 
 ## Usage
 

@@ -1,5 +1,6 @@
 #include "zeek_reader.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
@@ -120,10 +121,12 @@ string ZeekReader::ExtractInnerType(const string &zeek_type) {
 	return "string";
 }
 
-LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
+LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type, bool use_inet, ClientContext *context) {
 	if (zeek_type == "time") {
 		return LogicalType::TIMESTAMP_TZ;
-	} else if (zeek_type == "interval" || zeek_type == "double") {
+	} else if (zeek_type == "interval") {
+		return LogicalType::INTERVAL;
+	} else if (zeek_type == "double") {
 		return LogicalType::DOUBLE;
 	} else if (zeek_type == "count") {
 		return LogicalType::UBIGINT;
@@ -131,12 +134,25 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type) {
 		return LogicalType::BIGINT;
 	} else if (zeek_type == "bool") {
 		return LogicalType::BOOLEAN;
-	} else if (zeek_type == "string" || zeek_type == "addr" || zeek_type == "subnet" || zeek_type == "port" ||
-	           zeek_type == "enum") {
+	} else if (zeek_type == "port") {
+		return LogicalType::USMALLINT;
+	} else if (zeek_type == "addr" || zeek_type == "subnet") {
+		if (use_inet && context) {
+			try {
+				return TransformStringToLogicalType("INET", *context);
+			} catch (...) {
+				throw InvalidInputException(
+				    "Zeek type '%s' requires the inet extension. "
+				    "Run 'INSTALL inet; LOAD inet;' or use inet=false to read as VARCHAR.",
+				    zeek_type);
+			}
+		}
+		return LogicalType::VARCHAR;
+	} else if (zeek_type == "string" || zeek_type == "enum") {
 		return LogicalType::VARCHAR;
 	} else if (StringUtil::StartsWith(zeek_type, "vector[") || StringUtil::StartsWith(zeek_type, "set[")) {
 		string inner_type = ExtractInnerType(zeek_type);
-		LogicalType child_type = ZeekTypeToDuckDBType(inner_type);
+		LogicalType child_type = ZeekTypeToDuckDBType(inner_type, use_inet, context);
 		return LogicalType::LIST(child_type);
 	}
 	return LogicalType::VARCHAR;

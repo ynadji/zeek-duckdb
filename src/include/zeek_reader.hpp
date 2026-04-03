@@ -38,7 +38,8 @@ public:
 	//! Returns the parsed header and positions the file handle at the first data line
 	static ZeekHeader ParseHeader(FileHandle &file_handle);
 
-	static LogicalType ZeekTypeToDuckDBType(const string &zeek_type);
+	static LogicalType ZeekTypeToDuckDBType(const string &zeek_type, bool use_inet = true,
+	                                        ClientContext *context = nullptr);
 
 	static string ParseSeparator(const string &sep_str);
 
@@ -57,6 +58,8 @@ struct ZeekScanBindData : public TableFunctionData {
 	vector<LogicalType> column_types;
 	//! Whether to add a filename column
 	bool filename_column = false;
+	//! Whether to use INET type for addr/subnet (requires inet extension)
+	bool use_inet = true;
 };
 
 //! Global state for the read_zeek table function

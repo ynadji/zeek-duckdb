@@ -4,74 +4,104 @@
 
 require zeek
 
-# Test basic read from gzipped file
+# Test basic read from gzipped file (inet=false to avoid inet extension dependency)
 query IIIII
-SELECT ts, kuid, host_ip, conns_opened, conns_closed FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT ts, kuid, host_ip, conns_opened, conns_closed FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 2026-01-16 05:19:49.230929+00	Kfoql5dpOG1K1	10.21.7.136	1	1
 
 # Test count
 query I
-SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 1
 
 # Test NULL handling for unset field (-)
 query I
-SELECT host_inner_vlan IS NULL FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT host_inner_vlan IS NULL FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 true
 
-# Test column types - ts is now TIMESTAMP WITH TIME ZONE
+# Test column types
 query IIIII
-SELECT typeof(ts), typeof(duration), typeof(host_vlan), typeof(conns_opened), typeof(kuid) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT typeof(ts), typeof(duration), typeof(host_vlan), typeof(conns_opened), typeof(kuid) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
-TIMESTAMP WITH TIME ZONE	DOUBLE	BIGINT	UBIGINT	VARCHAR
+TIMESTAMP WITH TIME ZONE	INTERVAL	BIGINT	UBIGINT	VARCHAR
 
 # Test glob pattern - read all known_hosts files
 query I
-SELECT COUNT(*) FROM read_zeek('data/known_hosts*.gz');
+SELECT COUNT(*) FROM read_zeek('data/known_hosts*.gz', inet=false);
 ----
 27
 
 # Test glob pattern with filename column
 query I
-SELECT COUNT(DISTINCT filename) FROM read_zeek('data/known_hosts*.gz', filename=true);
+SELECT COUNT(DISTINCT filename) FROM read_zeek('data/known_hosts*.gz', filename=true, inet=false);
 ----
 24
 
 # Test filename column content
 query I
-SELECT filename FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', filename=true);
+SELECT filename FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', filename=true, inet=false);
 ----
 data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz
 
 # Test vector[string] type - returns LIST
 query I
-SELECT annotations FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT annotations FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 [foo, bar, baz]
 
 # Test vector[string] and vector[interval] from dns.log
 query II
-SELECT answers, TTLs FROM read_zeek('data/dns.log.gz') LIMIT 1;
+SELECT answers, TTLs FROM read_zeek('data/dns.log.gz', inet=false) LIMIT 1;
 ----
-[vhost-account.vip.icann.org, 192.0.32.17]	[2735.0, 30.0]
+[vhost-account.vip.icann.org, 192.0.32.17]	['00:45:35', '00:00:30']
 
 # Test set[string] from dhcp.log
 query I
-SELECT uids FROM read_zeek('data/dhcp.log.gz');
+SELECT uids FROM read_zeek('data/dhcp.log.gz', inet=false);
 ----
 [Cxkiqn3Sto5tM1CHA4, C1qMR61z0VQe1sDqYk]
 
 # Test typeof for LIST columns
 query II
-SELECT typeof(annotations), typeof(TTLs) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz'), read_zeek('data/dns.log.gz') LIMIT 1;
+SELECT typeof(annotations), typeof(TTLs) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false), read_zeek('data/dns.log.gz', inet=false) LIMIT 1;
 ----
-VARCHAR[]	DOUBLE[]
+VARCHAR[]	INTERVAL[]
 
 # Test timestamp extraction and comparison
 query I
-SELECT ts > '2026-01-01'::timestamptz FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+SELECT ts > '2026-01-01'::timestamptz FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 true
+
+# Test interval values
+query II
+SELECT duration, last_active_interval FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
+----
+00:05:23.12666	01:04:55.038597
+
+# Test interval from dhcp.log (86400 seconds = 1 day)
+query I
+SELECT lease_time FROM read_zeek('data/dhcp.log.gz', inet=false);
+----
+1 day
+
+# Test port type from dns.log
+query II
+SELECT typeof(id_orig_p), typeof(id_resp_p) FROM read_zeek('data/dns.log.gz', inet=false) LIMIT 1;
+----
+USMALLINT	USMALLINT
+
+# Test port values from dns.log
+query II
+SELECT id_orig_p, id_resp_p FROM read_zeek('data/dns.log.gz', inet=false) LIMIT 1;
+----
+51168	53
+
+# Test inet=false gives VARCHAR for addr columns
+query I
+SELECT typeof(host_ip) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
+----
+VARCHAR

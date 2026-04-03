@@ -1,0 +1,26 @@
+# name: test/sql/zeek_inet.test
+# description: test zeek extension with inet types
+# group: [sql]
+
+require zeek
+
+statement ok
+LOAD inet;
+
+# Test addr type (INET) from dns.log
+query II
+SELECT typeof(id_orig_h), typeof(id_resp_h) FROM read_zeek('data/dns.log.gz') LIMIT 1;
+----
+INET	INET
+
+# Test addr values from dns.log
+query II
+SELECT id_orig_h, id_resp_h FROM read_zeek('data/dns.log.gz') LIMIT 1;
+----
+10.20.40.41	8.8.4.4
+
+# Test addr type (INET) from known_hosts
+query I
+SELECT typeof(host_ip) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
+----
+INET

@@ -3,12 +3,18 @@
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/interval.hpp"
 
 namespace duckdb {
 
 static timestamp_tz_t EpochSecondsToTimestampTZ(double epoch_seconds) {
 	int64_t micros = static_cast<int64_t>(epoch_seconds * 1000000.0);
 	return timestamp_tz_t(micros);
+}
+
+static interval_t SecondsToInterval(double seconds) {
+	int64_t micros = static_cast<int64_t>(seconds * 1000000.0);
+	return Interval::FromMicro(micros);
 }
 
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
@@ -33,8 +39,9 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, con
 	return false;
 }
 
-static void AppendListValue(Vector &vec, idx_t row_idx, const string &field_value, char set_separator,
-                            const LogicalType &child_type, const string &unset_field, const string &empty_field) {
+static void AppendListValue(ClientContext &context, Vector &vec, idx_t row_idx, const string &field_value,
+                            char set_separator, const LogicalType &child_type, const string &unset_field,
+                            const string &empty_field) {
 	auto &list_entry = ListVector::GetData(vec)[row_idx];
 	auto current_size = ListVector::GetListSize(vec);
 
@@ -102,9 +109,33 @@ static void AppendListValue(Vector &vec, idx_t row_idx, const string &field_valu
 			}
 			break;
 		}
-		case LogicalTypeId::VARCHAR:
-		default: {
+		case LogicalTypeId::INTERVAL: {
+			try {
+				FlatVector::GetData<interval_t>(child_vec)[child_idx] = SecondsToInterval(std::stod(elem));
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
+			break;
+		}
+		case LogicalTypeId::USMALLINT: {
+			try {
+				auto val = std::stoul(elem);
+				if (val > 65535) {
+					FlatVector::SetNull(child_vec, child_idx, true);
+				} else {
+					FlatVector::GetData<uint16_t>(child_vec)[child_idx] = static_cast<uint16_t>(val);
+				}
+			} catch (...) {
+				FlatVector::SetNull(child_vec, child_idx, true);
+			}
+			break;
+		}
+		case LogicalTypeId::VARCHAR: {
 			FlatVector::GetData<string_t>(child_vec)[child_idx] = StringVector::AddString(child_vec, elem);
+			break;
+		}
+		default: {
+			child_vec.SetValue(child_idx, Value(elem).CastAs(context, child_type));
 			break;
 		}
 		}
@@ -139,6 +170,11 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		replace_periods = replace_periods_param->second.GetValue<bool>();
 	}
 
+	auto inet_param = input.named_parameters.find("inet");
+	if (inet_param != input.named_parameters.end()) {
+		result->use_inet = inet_param->second.GetValue<bool>();
+	}
+
 	auto file_handle =
 	    fs.OpenFile(result->file_paths[0], FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 	result->header = ZeekReader::ParseHeader(*file_handle);
@@ -149,7 +185,7 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 			std::replace(col_name.begin(), col_name.end(), '.', '_');
 		}
 		names.push_back(col_name);
-		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i]);
+		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i], result->use_inet, &context);
 		return_types.push_back(col_type);
 		result->column_types.push_back(col_type);
 	}
@@ -255,15 +291,39 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				}
 				break;
 			}
+			case LogicalTypeId::INTERVAL: {
+				try {
+					FlatVector::GetData<interval_t>(vec)[row_count] = SecondsToInterval(std::stod(field_value));
+				} catch (...) {
+					FlatVector::SetNull(vec, row_count, true);
+				}
+				break;
+			}
+			case LogicalTypeId::USMALLINT: {
+				try {
+					auto val = std::stoul(field_value);
+					if (val > 65535) {
+						FlatVector::SetNull(vec, row_count, true);
+					} else {
+						FlatVector::GetData<uint16_t>(vec)[row_count] = static_cast<uint16_t>(val);
+					}
+				} catch (...) {
+					FlatVector::SetNull(vec, row_count, true);
+				}
+				break;
+			}
 			case LogicalTypeId::LIST: {
 				auto &child_type = ListType::GetChildType(bind_data.column_types[col_idx]);
-				AppendListValue(vec, row_count, field_value, bind_data.header.set_separator, child_type,
+				AppendListValue(context, vec, row_count, field_value, bind_data.header.set_separator, child_type,
 				                bind_data.header.unset_field, bind_data.header.empty_field);
 				break;
 			}
-			case LogicalTypeId::VARCHAR:
-			default: {
+			case LogicalTypeId::VARCHAR: {
 				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, field_value);
+				break;
+			}
+			default: {
+				vec.SetValue(row_count, Value(field_value).CastAs(context, bind_data.column_types[col_idx]));
 				break;
 			}
 			}
@@ -285,6 +345,7 @@ TableFunction GetZeekScanFunction() {
 	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal);
 	func.named_parameters["filename"] = LogicalType::BOOLEAN;
 	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
+	func.named_parameters["inet"] = LogicalType::BOOLEAN;
 	return func;
 }
 
