@@ -5,6 +5,7 @@
 require zeek
 
 statement ok
+INSTALL inet;
 LOAD inet;
 
 # Test addr type (INET) from dns.log
