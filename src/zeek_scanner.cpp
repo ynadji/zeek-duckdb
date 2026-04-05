@@ -149,15 +149,14 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	auto glob_result = fs.GlobFiles(pattern, context, FileGlobOptions::DISALLOW_EMPTY);
+	auto glob_result = fs.Glob(pattern);
+	if (glob_result.empty()) {
+		throw IOException("No files found matching pattern: %s", pattern);
+	}
 	for (auto &file_info : glob_result) {
 		result->file_paths.push_back(file_info.path);
 	}
 	std::sort(result->file_paths.begin(), result->file_paths.end());
-
-	if (result->file_paths.empty()) {
-		throw IOException("No files found matching pattern: %s", pattern);
-	}
 
 	auto filename_param = input.named_parameters.find("filename");
 	if (filename_param != input.named_parameters.end()) {
