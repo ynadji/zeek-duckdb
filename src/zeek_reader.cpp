@@ -164,15 +164,15 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type, bool use_i
 
 bool SameSchema(const ZeekHeader &expected, const ZeekHeader &actual, string &mismatch_reason) {
 	if (expected.fields.size() != actual.fields.size()) {
-		mismatch_reason = StringUtil::Format("different field count: expected %llu fields, got %llu",
-		                                     (unsigned long long)expected.fields.size(),
-		                                     (unsigned long long)actual.fields.size());
+		mismatch_reason =
+		    StringUtil::Format("different field count: expected %llu fields, got %llu",
+		                       (unsigned long long)expected.fields.size(), (unsigned long long)actual.fields.size());
 		return false;
 	}
 	for (idx_t i = 0; i < expected.fields.size(); i++) {
 		if (expected.fields[i] != actual.fields[i]) {
-			mismatch_reason = StringUtil::Format("field %llu differs: expected '%s', got '%s'",
-			                                     (unsigned long long)i, expected.fields[i], actual.fields[i]);
+			mismatch_reason = StringUtil::Format("field %llu differs: expected '%s', got '%s'", (unsigned long long)i,
+			                                     expected.fields[i], actual.fields[i]);
 			return false;
 		}
 	}

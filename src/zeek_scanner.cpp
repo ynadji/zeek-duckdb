@@ -509,10 +509,9 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 				} else {
 					idx_t existing = it->second;
 					if (result->header.types[existing] != ftype) {
-						throw InvalidInputException(
-						    "read_zeek: field '%s' has type '%s' in '%s' but type '%s' in '%s'", fname,
-						    result->header.types[existing], result->file_paths[0], ftype,
-						    result->file_paths[file_idx]);
+						throw InvalidInputException("read_zeek: field '%s' has type '%s' in '%s' but type '%s' in '%s'",
+						                            fname, result->header.types[existing], result->file_paths[0], ftype,
+						                            result->file_paths[file_idx]);
 					}
 					file_field_to_union[file_idx][f] = existing;
 				}
