@@ -155,8 +155,7 @@ static Value SliceToValue(const FieldSlice &field, const LogicalType &type) {
 		return Value(type);
 	}
 	case LogicalTypeId::BOOLEAN: {
-		bool b = (field.len == 1 && field.ptr[0] == 'T') ||
-		         (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
+		bool b = (field.len == 1 && field.ptr[0] == 'T') || (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
 		return Value::BOOLEAN(b);
 	}
 	case LogicalTypeId::USMALLINT: {
@@ -333,8 +332,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		}
 		case LogicalTypeId::BOOLEAN: {
 			FlatVector::GetData<bool>(child_vec)[child_idx] =
-			    (elem.len == 1 && elem.ptr[0] == 'T') ||
-			    (elem.len == 4 && std::memcmp(elem.ptr, "true", 4) == 0);
+			    (elem.len == 1 && elem.ptr[0] == 'T') || (elem.len == 4 && std::memcmp(elem.ptr, "true", 4) == 0);
 			break;
 		}
 		case LogicalTypeId::TIMESTAMP_TZ: {
@@ -365,7 +363,8 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
-			FlatVector::GetData<string_t>(child_vec)[child_idx] = StringVector::AddString(child_vec, elem.ptr, elem.len);
+			FlatVector::GetData<string_t>(child_vec)[child_idx] =
+			    StringVector::AddString(child_vec, elem.ptr, elem.len);
 			break;
 		}
 		default: {
@@ -471,8 +470,8 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 	return std::move(result);
 }
 
-static unique_ptr<LocalTableFunctionState>
-ZeekScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+static unique_ptr<LocalTableFunctionState> ZeekScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                             GlobalTableFunctionState *global_state) {
 	auto &gstate = global_state->Cast<ZeekScanGlobalState>();
 	auto result = make_uniq<ZeekScanLocalState>();
 
@@ -655,9 +654,8 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				break;
 			}
 			case LogicalTypeId::BOOLEAN: {
-				FlatVector::GetData<bool>(vec)[row_count] =
-				    (field.len == 1 && field.ptr[0] == 'T') ||
-				    (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
+				FlatVector::GetData<bool>(vec)[row_count] = (field.len == 1 && field.ptr[0] == 'T') ||
+				                                            (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
 				break;
 			}
 			case LogicalTypeId::TIMESTAMP_TZ: {
