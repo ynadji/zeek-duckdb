@@ -2,6 +2,28 @@
 
 A DuckDB extension for reading [Zeek](https://zeek.org/) (formerly Bro) network security monitor log files.
 
+## Installing
+
+Starting with DuckDB v1.5.1, the Zeek extension can be installed from community with:
+
+```
+¡ duckdb
+DuckDB v1.5.1 (Variegata)
+Enter ".help" for usage hints.
+memory D INSTALL inet;
+memory D INSTALL zeek FROM community;
+memory D LOAD zeek;
+memory D SELECT * FROM read_zeek('data/dns.log.gz');
+┌───────────────────────────────┬────────────────────┬─────────────┬───────────┬───────────┬───────────┬─────────┬──────────┬───┬─────────┬─────────┬─────────┬─────────┬────────┬──────────────────────────┬──────────────────────┬──────────┐
+│              ts               │        uid         │  id_orig_h  │ id_orig_p │ id_resp_h │ id_resp_p │  proto  │ trans_id │ … │   AA    │   TC    │   RD    │   RA    │   Z    │         answers          │         TTLs         │ rejected │
+│   timestamp with time zone    │      varchar       │    inet     │  uint16   │   inet    │  uint16   │ varchar │  uint64  │ … │ boolean │ boolean │ boolean │ boolean │ uint64 │        varchar[]         │      interval[]      │ boolean  │
+├───────────────────────────────┼────────────────────┼─────────────┼───────────┼───────────┼───────────┼─────────┼──────────┼───┼─────────┼─────────┼─────────┼─────────┼────────┼──────────────────────────┼──────────────────────┼──────────┤
+│ 2026-01-16 00:00:02.060078-05 │ Csp4de4BFHPjq0Fyfa │ 10.20.40.41 │     51168 │ 8.8.4.4   │        53 │ udp     │    56933 │ … │ false   │ false   │ true    │ true    │      0 │ [vhost-account.vip.ican… │ ['00:45:35', '00:00… │ false    │
+│ 2026-01-16 00:00:02.064667-05 │ C61GeE23uDUeX311zl │ 10.20.40.41 │     49581 │ 8.8.4.4   │        53 │ udp     │     1471 │ … │ false   │ false   │ true    │ true    │      0 │ [vhost-account.vip.ican… │ ['00:40:29', '00:00… │ false    │
+└───────────────────────────────┴────────────────────┴─────────────┴───────────┴───────────┴───────────┴─────────┴──────────┴───┴─────────┴─────────┴─────────┴─────────┴────────┴──────────────────────────┴──────────────────────┴──────────┘
+  2 rows                                                                                        use .last to show entire result                                                                                         24 columns (16 shown)
+```
+
 ## Features
 
 - Read Zeek TSV log files with automatic schema detection
@@ -98,6 +120,10 @@ Zeek logs are self-describing TSV files with metadata headers:
 ```
 
 The extension automatically parses these headers to determine column names and types.
+
+## Reporting Bugs
+
+Please report any bugs or feature requests on this repo, rather than any of DuckDB's repos.
 
 ## License
 
