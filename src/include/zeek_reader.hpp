@@ -62,6 +62,12 @@ struct ZeekScanBindData : public TableFunctionData {
 	bool use_inet = true;
 };
 
+//! A view into a contiguous span of bytes (no ownership)
+struct FieldSlice {
+	const char *ptr;
+	uint32_t len;
+};
+
 //! Global state for the read_zeek table function
 struct ZeekScanGlobalState : public GlobalTableFunctionState {
 	//! Current file index
@@ -70,10 +76,27 @@ struct ZeekScanGlobalState : public GlobalTableFunctionState {
 	unique_ptr<FileHandle> file_handle;
 	//! Whether we've finished reading all files
 	bool finished = false;
-	//! Buffer for reading lines
-	string line_buffer;
 	//! Current file path (for filename column)
 	string current_file_path;
+
+	//! Buffered I/O: raw bytes read from the file
+	vector<char> read_buffer;
+	idx_t buffer_pos = 0;
+	idx_t buffer_size = 0;
+	bool eof_reached = false;
+
+	//! Current line, accumulated across buffer refills if needed
+	vector<char> line_buffer;
+	//! Field slices into line_buffer (reused per row)
+	vector<FieldSlice> field_slices;
+	//! Element slices for LIST values (reused per LIST cell)
+	vector<FieldSlice> list_element_slices;
+
+	//! Projection pushdown: for each output column index, the schema column index it maps to.
+	//! A value of data_col_count means the filename virtual column.
+	vector<column_t> projected_schema_cols;
+	//! True if no columns are projected (e.g. COUNT(*)) — skip all parsing
+	bool count_only = false;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded for now

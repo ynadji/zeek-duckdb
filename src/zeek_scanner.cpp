@@ -4,8 +4,13 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+
+#include <cstring>
 
 namespace duckdb {
+
+static constexpr idx_t READ_BUFFER_SIZE = 65536; // 64KB
 
 static timestamp_tz_t EpochSecondsToTimestampTZ(double epoch_seconds) {
 	int64_t micros = static_cast<int64_t>(epoch_seconds * 1000000.0);
@@ -15,6 +20,64 @@ static timestamp_tz_t EpochSecondsToTimestampTZ(double epoch_seconds) {
 static interval_t SecondsToInterval(double seconds) {
 	int64_t micros = static_cast<int64_t>(seconds * 1000000.0);
 	return Interval::FromMicro(micros);
+}
+
+//! Read one line from the buffered file into state.line_buffer.
+//! Returns false on EOF (with line_buffer empty).
+static bool ReadLineBuffered(ZeekScanGlobalState &state) {
+	state.line_buffer.clear();
+
+	while (true) {
+		// Refill the read buffer if exhausted.
+		if (state.buffer_pos >= state.buffer_size) {
+			if (state.eof_reached) {
+				return !state.line_buffer.empty();
+			}
+			state.buffer_size = state.file_handle->Read(state.read_buffer.data(), state.read_buffer.size());
+			state.buffer_pos = 0;
+			if (state.buffer_size == 0) {
+				state.eof_reached = true;
+				return !state.line_buffer.empty();
+			}
+		}
+
+		const char *start = state.read_buffer.data() + state.buffer_pos;
+		idx_t remaining = state.buffer_size - state.buffer_pos;
+		const char *newline = static_cast<const char *>(std::memchr(start, '\n', remaining));
+
+		if (newline) {
+			idx_t line_len = static_cast<idx_t>(newline - start);
+			state.line_buffer.insert(state.line_buffer.end(), start, start + line_len);
+			state.buffer_pos += line_len + 1;
+			// Strip trailing \r if present (handles \r\n line endings even across buffer boundaries).
+			if (!state.line_buffer.empty() && state.line_buffer.back() == '\r') {
+				state.line_buffer.pop_back();
+			}
+			return true;
+		}
+
+		// No newline in this buffer chunk — copy what we have and refill.
+		state.line_buffer.insert(state.line_buffer.end(), start, start + remaining);
+		state.buffer_pos = state.buffer_size;
+	}
+}
+
+//! Tokenize a span by separator into the given slices vector (reused).
+static void TokenizeSpan(const char *data, uint32_t len, char separator, vector<FieldSlice> &slices) {
+	slices.clear();
+	uint32_t start = 0;
+	for (uint32_t i = 0; i < len; i++) {
+		if (data[i] == separator) {
+			slices.push_back({data + start, i - start});
+			start = i + 1;
+		}
+	}
+	slices.push_back({data + start, len - start});
+}
+
+//! Compare a slice to a string for equality (used for unset/empty markers).
+static inline bool SliceEquals(const FieldSlice &s, const string &str) {
+	return s.len == str.size() && std::memcmp(s.ptr, str.data(), s.len) == 0;
 }
 
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
@@ -27,10 +90,15 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, con
 		state.file_handle =
 		    fs.OpenFile(state.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 
-		string line;
+		// Reset buffer state for the new file.
+		state.buffer_pos = 0;
+		state.buffer_size = 0;
+		state.eof_reached = false;
+
+		// Skip header lines using the buffered reader.
 		idx_t lines_to_skip = bind_data.header.header_line_count;
 		for (idx_t i = 0; i < lines_to_skip; i++) {
-			if (!ZeekReader::ReadLine(*state.file_handle, line)) {
+			if (!ReadLineBuffered(state)) {
 				break;
 			}
 		}
@@ -39,21 +107,20 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, con
 	return false;
 }
 
-static void AppendListValue(ClientContext &context, Vector &vec, idx_t row_idx, const string &field_value,
-                            char set_separator, const LogicalType &child_type, const string &unset_field,
-                            const string &empty_field) {
+static void AppendListValue(ClientContext &context, ZeekScanGlobalState &state, Vector &vec, idx_t row_idx,
+                            const FieldSlice &field, char set_separator, const LogicalType &child_type,
+                            const string &unset_field, const string &empty_field) {
 	auto &list_entry = ListVector::GetData(vec)[row_idx];
 	auto current_size = ListVector::GetListSize(vec);
 
-	if (field_value == unset_field || field_value == empty_field) {
+	if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
 		list_entry.offset = current_size;
 		list_entry.length = 0;
 		return;
 	}
 
-	vector<string> elements;
-	string sep_str(1, set_separator);
-	elements = StringUtil::Split(field_value, sep_str);
+	TokenizeSpan(field.ptr, field.len, set_separator, state.list_element_slices);
+	auto &elements = state.list_element_slices;
 
 	list_entry.offset = current_size;
 	list_entry.length = elements.size();
@@ -65,77 +132,82 @@ static void AppendListValue(ClientContext &context, Vector &vec, idx_t row_idx, 
 	auto child_type_id = child_type.id();
 	for (idx_t i = 0; i < elements.size(); i++) {
 		idx_t child_idx = current_size + i;
-		const string &elem = elements[i];
+		const FieldSlice &elem = elements[i];
 
-		if (elem == unset_field || elem == empty_field) {
+		if (SliceEquals(elem, unset_field) || SliceEquals(elem, empty_field)) {
 			FlatVector::SetNull(child_vec, child_idx, true);
 			continue;
 		}
 
+		string_t elem_str(elem.ptr, elem.len);
+
 		switch (child_type_id) {
 		case LogicalTypeId::DOUBLE: {
-			try {
-				FlatVector::GetData<double>(child_vec)[child_idx] = std::stod(elem);
-			} catch (...) {
+			double val;
+			if (TryCast::Operation<string_t, double>(elem_str, val)) {
+				FlatVector::GetData<double>(child_vec)[child_idx] = val;
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::UBIGINT: {
-			try {
-				FlatVector::GetData<uint64_t>(child_vec)[child_idx] = std::stoull(elem);
-			} catch (...) {
+			uint64_t val;
+			if (TryCast::Operation<string_t, uint64_t>(elem_str, val)) {
+				FlatVector::GetData<uint64_t>(child_vec)[child_idx] = val;
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::BIGINT: {
-			try {
-				FlatVector::GetData<int64_t>(child_vec)[child_idx] = std::stoll(elem);
-			} catch (...) {
+			int64_t val;
+			if (TryCast::Operation<string_t, int64_t>(elem_str, val)) {
+				FlatVector::GetData<int64_t>(child_vec)[child_idx] = val;
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::BOOLEAN: {
-			FlatVector::GetData<bool>(child_vec)[child_idx] = (elem == "T" || elem == "true");
+			FlatVector::GetData<bool>(child_vec)[child_idx] =
+			    (elem.len == 1 && elem.ptr[0] == 'T') ||
+			    (elem.len == 4 && std::memcmp(elem.ptr, "true", 4) == 0);
 			break;
 		}
 		case LogicalTypeId::TIMESTAMP_TZ: {
-			try {
-				FlatVector::GetData<timestamp_tz_t>(child_vec)[child_idx] = EpochSecondsToTimestampTZ(std::stod(elem));
-			} catch (...) {
+			double val;
+			if (TryCast::Operation<string_t, double>(elem_str, val)) {
+				FlatVector::GetData<timestamp_tz_t>(child_vec)[child_idx] = EpochSecondsToTimestampTZ(val);
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::INTERVAL: {
-			try {
-				FlatVector::GetData<interval_t>(child_vec)[child_idx] = SecondsToInterval(std::stod(elem));
-			} catch (...) {
+			double val;
+			if (TryCast::Operation<string_t, double>(elem_str, val)) {
+				FlatVector::GetData<interval_t>(child_vec)[child_idx] = SecondsToInterval(val);
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::USMALLINT: {
-			try {
-				auto val = std::stoul(elem);
-				if (val > 65535) {
-					FlatVector::SetNull(child_vec, child_idx, true);
-				} else {
-					FlatVector::GetData<uint16_t>(child_vec)[child_idx] = static_cast<uint16_t>(val);
-				}
-			} catch (...) {
+			uint16_t val;
+			if (TryCast::Operation<string_t, uint16_t>(elem_str, val)) {
+				FlatVector::GetData<uint16_t>(child_vec)[child_idx] = val;
+			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
-			FlatVector::GetData<string_t>(child_vec)[child_idx] = StringVector::AddString(child_vec, elem);
+			FlatVector::GetData<string_t>(child_vec)[child_idx] = StringVector::AddString(child_vec, elem.ptr, elem.len);
 			break;
 		}
 		default: {
-			child_vec.SetValue(child_idx, Value(elem).CastAs(context, child_type));
+			child_vec.SetValue(child_idx, Value(string(elem.ptr, elem.len)).CastAs(context, child_type));
 			break;
 		}
 		}
@@ -201,6 +273,20 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 	auto &bind_data = input.bind_data->Cast<ZeekScanBindData>();
 	auto result = make_uniq<ZeekScanGlobalState>();
 
+	// Allocate the read buffer.
+	result->read_buffer.resize(READ_BUFFER_SIZE);
+
+	// Resolve projection: which schema columns does the query actually want?
+	// column_ids is provided by DuckDB when projection_pushdown = true.
+	// An empty column_ids means COUNT(*) — no columns needed at all.
+	if (input.column_ids.empty()) {
+		result->count_only = true;
+	} else {
+		for (auto &col_id : input.column_ids) {
+			result->projected_schema_cols.push_back(col_id);
+		}
+	}
+
 	if (!OpenNextFile(context, *result, bind_data)) {
 		result->finished = true;
 	}
@@ -218,11 +304,14 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 	}
 
 	idx_t row_count = 0;
-	string line;
-	idx_t data_col_count = bind_data.column_types.size();
+	const idx_t data_col_count = bind_data.column_types.size();
+	const idx_t filename_col_idx = data_col_count; // virtual column index for filename
+	const string &unset_field = bind_data.header.unset_field;
+	const string &empty_field = bind_data.header.empty_field;
+	const char field_separator = bind_data.header.separator;
 
 	while (row_count < STANDARD_VECTOR_SIZE) {
-		if (!ZeekReader::ReadLine(*state.file_handle, line)) {
+		if (!ReadLineBuffered(state)) {
 			if (!OpenNextFile(context, state, bind_data)) {
 				state.finished = true;
 				break;
@@ -230,108 +319,126 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			continue;
 		}
 
-		if (line.empty() || line[0] == '#') {
+		// Skip empty lines and Zeek metadata comment lines.
+		if (state.line_buffer.empty() || state.line_buffer[0] == '#') {
 			continue;
 		}
 
-		vector<string> fields = StringUtil::Split(line, bind_data.header.separator);
+		// COUNT(*) fast path: no columns needed, just count rows.
+		if (state.count_only) {
+			row_count++;
+			continue;
+		}
 
-		for (idx_t col_idx = 0; col_idx < data_col_count; col_idx++) {
-			auto &vec = output.data[col_idx];
+		// Tokenize the line into field slices (reused vector — no allocation per row in steady state).
+		TokenizeSpan(state.line_buffer.data(), static_cast<uint32_t>(state.line_buffer.size()), field_separator,
+		             state.field_slices);
+		const idx_t num_fields = state.field_slices.size();
 
-			if (col_idx >= fields.size()) {
+		// Walk projected output columns and emit values for those.
+		for (idx_t out_idx = 0; out_idx < state.projected_schema_cols.size(); out_idx++) {
+			column_t schema_col = state.projected_schema_cols[out_idx];
+			auto &vec = output.data[out_idx];
+
+			// Filename virtual column.
+			if (bind_data.filename_column && schema_col == filename_col_idx) {
+				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, state.current_file_path);
+				continue;
+			}
+
+			// Out-of-range data column → NULL.
+			if (schema_col >= num_fields) {
 				FlatVector::SetNull(vec, row_count, true);
 				continue;
 			}
 
-			const string &field_value = fields[col_idx];
+			const FieldSlice &field = state.field_slices[schema_col];
 
-			if (field_value == bind_data.header.unset_field || field_value == bind_data.header.empty_field) {
+			if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
 				FlatVector::SetNull(vec, row_count, true);
 				continue;
 			}
 
-			auto type_id = bind_data.column_types[col_idx].id();
+			string_t field_str(field.ptr, field.len);
+			auto type_id = bind_data.column_types[schema_col].id();
+
 			switch (type_id) {
+			case LogicalTypeId::VARCHAR: {
+				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, field.ptr, field.len);
+				break;
+			}
 			case LogicalTypeId::DOUBLE: {
-				try {
-					FlatVector::GetData<double>(vec)[row_count] = std::stod(field_value);
-				} catch (...) {
+				double val;
+				if (TryCast::Operation<string_t, double>(field_str, val)) {
+					FlatVector::GetData<double>(vec)[row_count] = val;
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::UBIGINT: {
-				try {
-					FlatVector::GetData<uint64_t>(vec)[row_count] = std::stoull(field_value);
-				} catch (...) {
+				uint64_t val;
+				if (TryCast::Operation<string_t, uint64_t>(field_str, val)) {
+					FlatVector::GetData<uint64_t>(vec)[row_count] = val;
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::BIGINT: {
-				try {
-					FlatVector::GetData<int64_t>(vec)[row_count] = std::stoll(field_value);
-				} catch (...) {
+				int64_t val;
+				if (TryCast::Operation<string_t, int64_t>(field_str, val)) {
+					FlatVector::GetData<int64_t>(vec)[row_count] = val;
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::BOOLEAN: {
-				FlatVector::GetData<bool>(vec)[row_count] = (field_value == "T" || field_value == "true");
+				FlatVector::GetData<bool>(vec)[row_count] =
+				    (field.len == 1 && field.ptr[0] == 'T') ||
+				    (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
 				break;
 			}
 			case LogicalTypeId::TIMESTAMP_TZ: {
-				try {
-					FlatVector::GetData<timestamp_tz_t>(vec)[row_count] =
-					    EpochSecondsToTimestampTZ(std::stod(field_value));
-				} catch (...) {
+				double val;
+				if (TryCast::Operation<string_t, double>(field_str, val)) {
+					FlatVector::GetData<timestamp_tz_t>(vec)[row_count] = EpochSecondsToTimestampTZ(val);
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::INTERVAL: {
-				try {
-					FlatVector::GetData<interval_t>(vec)[row_count] = SecondsToInterval(std::stod(field_value));
-				} catch (...) {
+				double val;
+				if (TryCast::Operation<string_t, double>(field_str, val)) {
+					FlatVector::GetData<interval_t>(vec)[row_count] = SecondsToInterval(val);
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::USMALLINT: {
-				try {
-					auto val = std::stoul(field_value);
-					if (val > 65535) {
-						FlatVector::SetNull(vec, row_count, true);
-					} else {
-						FlatVector::GetData<uint16_t>(vec)[row_count] = static_cast<uint16_t>(val);
-					}
-				} catch (...) {
+				uint16_t val;
+				if (TryCast::Operation<string_t, uint16_t>(field_str, val)) {
+					FlatVector::GetData<uint16_t>(vec)[row_count] = val;
+				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::LIST: {
-				auto &child_type = ListType::GetChildType(bind_data.column_types[col_idx]);
-				AppendListValue(context, vec, row_count, field_value, bind_data.header.set_separator, child_type,
-				                bind_data.header.unset_field, bind_data.header.empty_field);
-				break;
-			}
-			case LogicalTypeId::VARCHAR: {
-				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, field_value);
+				auto &child_type = ListType::GetChildType(bind_data.column_types[schema_col]);
+				AppendListValue(context, state, vec, row_count, field, bind_data.header.set_separator, child_type,
+				                unset_field, empty_field);
 				break;
 			}
 			default: {
-				vec.SetValue(row_count, Value(field_value).CastAs(context, bind_data.column_types[col_idx]));
+				vec.SetValue(row_count,
+				             Value(string(field.ptr, field.len)).CastAs(context, bind_data.column_types[schema_col]));
 				break;
 			}
 			}
-		}
-
-		if (bind_data.filename_column) {
-			auto &filename_vec = output.data[data_col_count];
-			FlatVector::GetData<string_t>(filename_vec)[row_count] =
-			    StringVector::AddString(filename_vec, state.current_file_path);
 		}
 
 		row_count++;
@@ -345,6 +452,7 @@ TableFunction GetZeekScanFunction() {
 	func.named_parameters["filename"] = LogicalType::BOOLEAN;
 	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
 	func.named_parameters["inet"] = LogicalType::BOOLEAN;
+	func.projection_pushdown = true;
 	return func;
 }
 
