@@ -205,3 +205,38 @@ query I
 SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false) WHERE host_vlan IS NOT NULL;
 ----
 1
+
+# ================================================================
+# Schema validation across globbed files
+# ================================================================
+
+# Two files in the same dir with the same schema → reads all rows from both
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_match/*.log', inet=false);
+----
+3
+
+# Reading a single file works regardless of validation
+query III
+SELECT ts, id, value FROM read_zeek('data/schema_match/a.log', inet=false) ORDER BY id;
+----
+2026-01-16 05:19:49+00	A1	10
+2026-01-16 05:19:50+00	A2	20
+
+# Glob over files with different field counts → error naming both files and the mismatch
+statement error
+SELECT * FROM read_zeek('data/schema_extra/*.log', inet=false);
+----
+different field count
+
+# Glob over files with reordered fields → error
+statement error
+SELECT * FROM read_zeek('data/schema_reorder/*.log', inet=false);
+----
+field 0 differs
+
+# Glob over files with a type mismatch on a shared field → error
+statement error
+SELECT * FROM read_zeek('data/schema_type/*.log', inet=false);
+----
+type for field 'value' differs

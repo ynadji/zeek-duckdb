@@ -47,6 +47,49 @@ bool ZeekReader::ReadLine(FileHandle &file_handle, string &line) {
 	}
 }
 
+bool ZeekReader::ApplyHeaderLine(const char *line, idx_t len, ZeekHeader &header) {
+	if (len == 0 || line[0] != '#') {
+		return false;
+	}
+
+	// Find the first separator (tab or space) after the directive name.
+	idx_t sep_pos = 1;
+	while (sep_pos < len && line[sep_pos] != '\t' && line[sep_pos] != ' ') {
+		sep_pos++;
+	}
+
+	string directive(line + 1, sep_pos - 1);
+	string value;
+	if (sep_pos < len) {
+		value.assign(line + sep_pos + 1, len - sep_pos - 1);
+	}
+
+	if (directive == "separator") {
+		string parsed = ParseSeparator(value);
+		if (!parsed.empty()) {
+			header.separator = parsed[0];
+		}
+	} else if (directive == "set_separator") {
+		string parsed = ParseSeparator(value);
+		if (!parsed.empty()) {
+			header.set_separator = parsed[0];
+		}
+	} else if (directive == "empty_field") {
+		header.empty_field = value;
+	} else if (directive == "unset_field") {
+		header.unset_field = value;
+	} else if (directive == "path") {
+		header.path = value;
+	} else if (directive == "open") {
+		header.open_time = value;
+	} else if (directive == "fields") {
+		header.fields = StringUtil::Split(value, header.separator);
+	} else if (directive == "types") {
+		header.types = StringUtil::Split(value, header.separator);
+	}
+	return true;
+}
+
 ZeekHeader ZeekReader::ParseHeader(FileHandle &file_handle) {
 	ZeekHeader header;
 	string line;
@@ -54,46 +97,8 @@ ZeekHeader ZeekReader::ParseHeader(FileHandle &file_handle) {
 
 	while (ReadLine(file_handle, line)) {
 		line_count++;
-		if (line.empty() || line[0] != '#') {
+		if (!ApplyHeaderLine(line.data(), line.size(), header)) {
 			break;
-		}
-
-		size_t space_pos = line.find('\t');
-		if (space_pos == string::npos) {
-			space_pos = line.find(' ');
-		}
-
-		string directive;
-		string value;
-		if (space_pos != string::npos) {
-			directive = line.substr(1, space_pos - 1);
-			value = line.substr(space_pos + 1);
-		} else {
-			directive = line.substr(1);
-		}
-
-		if (directive == "separator") {
-			string parsed = ParseSeparator(value);
-			if (!parsed.empty()) {
-				header.separator = parsed[0];
-			}
-		} else if (directive == "set_separator") {
-			string parsed = ParseSeparator(value);
-			if (!parsed.empty()) {
-				header.set_separator = parsed[0];
-			}
-		} else if (directive == "empty_field") {
-			header.empty_field = value;
-		} else if (directive == "unset_field") {
-			header.unset_field = value;
-		} else if (directive == "path") {
-			header.path = value;
-		} else if (directive == "open") {
-			header.open_time = value;
-		} else if (directive == "fields") {
-			header.fields = StringUtil::Split(value, header.separator);
-		} else if (directive == "types") {
-			header.types = StringUtil::Split(value, header.separator);
 		}
 	}
 
@@ -155,6 +160,48 @@ LogicalType ZeekReader::ZeekTypeToDuckDBType(const string &zeek_type, bool use_i
 		return LogicalType::LIST(child_type);
 	}
 	return LogicalType::VARCHAR;
+}
+
+bool SameSchema(const ZeekHeader &expected, const ZeekHeader &actual, string &mismatch_reason) {
+	if (expected.fields.size() != actual.fields.size()) {
+		mismatch_reason = StringUtil::Format("different field count: expected %llu fields, got %llu",
+		                                     (unsigned long long)expected.fields.size(),
+		                                     (unsigned long long)actual.fields.size());
+		return false;
+	}
+	for (idx_t i = 0; i < expected.fields.size(); i++) {
+		if (expected.fields[i] != actual.fields[i]) {
+			mismatch_reason = StringUtil::Format("field %llu differs: expected '%s', got '%s'",
+			                                     (unsigned long long)i, expected.fields[i], actual.fields[i]);
+			return false;
+		}
+	}
+	for (idx_t i = 0; i < expected.types.size(); i++) {
+		if (expected.types[i] != actual.types[i]) {
+			mismatch_reason = StringUtil::Format("type for field '%s' differs: expected '%s', got '%s'",
+			                                     expected.fields[i], expected.types[i], actual.types[i]);
+			return false;
+		}
+	}
+	if (expected.separator != actual.separator) {
+		mismatch_reason = "#separator differs";
+		return false;
+	}
+	if (expected.set_separator != actual.set_separator) {
+		mismatch_reason = "#set_separator differs";
+		return false;
+	}
+	if (expected.unset_field != actual.unset_field) {
+		mismatch_reason = StringUtil::Format("#unset_field differs: expected '%s', got '%s'", expected.unset_field,
+		                                     actual.unset_field);
+		return false;
+	}
+	if (expected.empty_field != actual.empty_field) {
+		mismatch_reason = StringUtil::Format("#empty_field differs: expected '%s', got '%s'", expected.empty_field,
+		                                     actual.empty_field);
+		return false;
+	}
+	return true;
 }
 
 } // namespace duckdb

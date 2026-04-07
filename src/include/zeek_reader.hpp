@@ -48,7 +48,19 @@ public:
 	static bool ReadLine(FileHandle &file_handle, string &line);
 
 	static string ExtractInnerType(const string &zeek_type);
+
+	//! Apply a single header line to a ZeekHeader. Returns true if the line was a directive
+	//! (i.e. starts with '#') and was consumed; false if it was a data line. Does not modify
+	//! `header` if it returns false.
+	static bool ApplyHeaderLine(const char *line, idx_t len, ZeekHeader &header);
 };
+
+//! Compare two parsed headers for schema equivalence. Returns true if they describe the same
+//! Zeek log schema. On mismatch, populates `mismatch_reason` with a brief human-readable
+//! description of the first difference found and returns false. The fields compared are:
+//! `fields`, `types`, `separator`, `set_separator`, `unset_field`, `empty_field`. The
+//! `path` and `open_time` fields are intentionally ignored.
+bool SameSchema(const ZeekHeader &expected, const ZeekHeader &actual, string &mismatch_reason);
 
 //! Bind data for the read_zeek table function
 struct ZeekScanBindData : public TableFunctionData {
@@ -114,6 +126,10 @@ struct ZeekScanLocalState : public LocalTableFunctionState {
 
 	//! Current line, accumulated across buffer refills if needed.
 	vector<char> line_buffer;
+	//! When true, line_buffer holds a line that was already read but not yet consumed by the
+	//! caller (e.g., the first data line peeked at by the per-file header parser). The next
+	//! call to ReadLineBuffered will return this line as-is and clear the flag.
+	bool has_pending_line = false;
 	//! Field slices into line_buffer (reused per row).
 	vector<FieldSlice> field_slices;
 	//! Element slices for LIST values (reused per LIST cell).

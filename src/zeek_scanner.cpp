@@ -32,6 +32,11 @@ static interval_t SecondsToInterval(double seconds) {
 //! Read one line from the buffered file into lstate.line_buffer.
 //! Returns false on EOF (with line_buffer empty).
 static bool ReadLineBuffered(ZeekScanLocalState &lstate) {
+	// If a previous header parse "peeked" at the first data line and stashed it, hand it back.
+	if (lstate.has_pending_line) {
+		lstate.has_pending_line = false;
+		return true;
+	}
 	lstate.line_buffer.clear();
 
 	while (true) {
@@ -256,13 +261,37 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 		lstate.buffer_pos = 0;
 		lstate.buffer_size = 0;
 		lstate.eof_reached = false;
+		lstate.has_pending_line = false;
 
-		// Skip header lines using the buffered reader.
-		idx_t lines_to_skip = bind_data.header.header_line_count;
-		for (idx_t i = 0; i < lines_to_skip; i++) {
-			if (!ReadLineBuffered(lstate)) {
+		// Parse this file's header via the buffered reader and validate against the bound schema.
+		// We read lines until we hit the first non-directive (data) line, parse each `#` line as
+		// a directive, and leave the first data line in line_buffer with has_pending_line=true so
+		// the hot loop can consume it without re-reading.
+		ZeekHeader file_header;
+		while (ReadLineBuffered(lstate)) {
+			if (!ZeekReader::ApplyHeaderLine(lstate.line_buffer.data(), lstate.line_buffer.size(), file_header)) {
+				// First non-directive line — this is the first data row. Stash it.
+				lstate.has_pending_line = true;
 				break;
 			}
+		}
+
+		if (file_header.fields.empty()) {
+			throw InvalidInputException("read_zeek: file '%s' is missing #fields directive", lstate.current_file_path);
+		}
+		if (file_header.types.empty()) {
+			throw InvalidInputException("read_zeek: file '%s' is missing #types directive", lstate.current_file_path);
+		}
+		if (file_header.fields.size() != file_header.types.size()) {
+			throw InvalidInputException("read_zeek: file '%s' has mismatched #fields and #types counts",
+			                            lstate.current_file_path);
+		}
+
+		string mismatch;
+		if (!SameSchema(bind_data.header, file_header, mismatch)) {
+			throw InvalidInputException(
+			    "read_zeek: file '%s' has a different schema than '%s' (the first file in the glob): %s",
+			    lstate.current_file_path, bind_data.file_paths[0], mismatch);
 		}
 		return true;
 	}
