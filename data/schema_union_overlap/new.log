@@ -1,0 +1,10 @@
+#separator 	
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#path	test
+#fields	ts	id	value	extra	newfield
+#types	time	string	count	string	bool
+1768540791.000000	B1	30	hello	T
+1768540792.000000	B2	40	world	F
+#close	2026-01-16-02-00-00
