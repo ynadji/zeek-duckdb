@@ -24,14 +24,7 @@ memory D SELECT * FROM read_zeek('data/dns.log.gz');
   2 rows                                                                                        use .last to show entire result                                                                                         24 columns (16 shown)
 ```
 
-## Features
-
-- Read Zeek TSV log files with automatic schema detection
-- Automatic gzip decompression (`.gz` files)
-- Proper NULL handling for unset (`-`) and empty (`(empty)`) fields
-- Type-aware parsing of Zeek types to DuckDB types
-
-## Supported Zeek Types
+## Zeek Types <-> DuckDB Types
 
 | Zeek Type | DuckDB Type |
 |-----------|-------------|
@@ -55,6 +48,9 @@ memory D SELECT * FROM read_zeek('data/dns.log.gz');
 -- Read a Zeek log file (supports .gz compression)
 SELECT * FROM read_zeek('conn.log.gz');
 
+-- Also supports zstd compression
+SELECT * FROM read_zeek('conn.log.zst');
+
 -- Query with filtering
 SELECT ts, id.orig_h, id.resp_h, service
 FROM read_zeek('conn.log.gz')
@@ -65,6 +61,38 @@ SELECT host_ip, SUM(conns_opened) as total_conns
 FROM read_zeek('known_hosts.log.gz')
 GROUP BY host_ip
 ORDER BY total_conns DESC;
+```
+
+## `read_zeek` Options
+
+The `read_zeek` table function takes a file path or glob pattern as its first argument, plus the following named parameters:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `inet` | `BOOLEAN` | `true` | Map Zeek `addr` and `subnet` to DuckDB `INET`. Requires the `inet` extension (`INSTALL inet; LOAD inet;`). Set to `false` to read these columns as `VARCHAR` instead. |
+| `filename` | `BOOLEAN` | `false` | Add a `filename` column to the output that holds the path of the source file each row came from. Mostly useful when reading globs. |
+| `replace_periods` | `BOOLEAN` | `true` | Replace `.` with `_` in column names so they can be referenced unquoted in SQL. For example, `id.orig_h` becomes `id_orig_h`. Set to `false` to keep the original names — you'll then need to quote them, e.g. `"id.orig_h"`. |
+| `union_by_name` | `BOOLEAN` | `false` | When reading multiple files via a glob, build the output schema as the *union* of every file's fields. Fields absent from a file become `NULL` in that file's rows. Same field name with different Zeek types across files is a bind-time error. When `false` (the default), all files in the glob must have an identical schema — any mismatch (different field count, reordered fields, type change) raises an error rather than silently producing wrong results. |
+
+### Examples
+
+```sql
+-- Read a glob, tagging each row with its source file
+SELECT filename, COUNT(*)
+FROM read_zeek('logs/conn_*.log.gz', filename=true)
+GROUP BY filename;
+
+-- Read across years of logs, even if newer files added fields
+SELECT id_orig_h, service, proto
+FROM read_zeek('logs/conn_*.log.gz', union_by_name=true)
+WHERE proto IS NOT NULL;
+
+-- Filter on an IP address using INET semantics
+SELECT * FROM read_zeek('data/dns.log.gz')
+WHERE id_orig_h <<= '10.20.40.0/24';
+
+-- Read addresses as plain VARCHAR (no inet extension required)
+SELECT host_ip FROM read_zeek('known_hosts.log.gz', inet=false);
 ```
 
 ## Building
