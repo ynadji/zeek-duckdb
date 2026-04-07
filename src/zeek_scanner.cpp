@@ -5,6 +5,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 #include <cstring>
 
@@ -78,6 +79,24 @@ static void TokenizeSpan(const char *data, uint32_t len, char separator, vector<
 //! Compare a slice to a string for equality (used for unset/empty markers).
 static inline bool SliceEquals(const FieldSlice &s, const string &str) {
 	return s.len == str.size() && std::memcmp(s.ptr, str.data(), s.len) == 0;
+}
+
+//! Returns true if the given type is handled directly in the per-row switch (no batch cast needed).
+static bool IsNativelyHandled(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::INTERVAL:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::LIST:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
@@ -287,6 +306,25 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 		}
 	}
 
+	// For each projected column whose type isn't natively handled (e.g. INET),
+	// allocate a temporary VARCHAR vector so we can batch-cast at end of chunk.
+	const idx_t data_col_count = bind_data.column_types.size();
+	result->cast_temp_vecs.resize(result->projected_schema_cols.size());
+	for (idx_t out_idx = 0; out_idx < result->projected_schema_cols.size(); out_idx++) {
+		column_t schema_col = result->projected_schema_cols[out_idx];
+		// Filename virtual column is always VARCHAR — handled natively.
+		if (bind_data.filename_column && schema_col == data_col_count) {
+			continue;
+		}
+		if (schema_col >= data_col_count) {
+			continue;
+		}
+		const auto &type = bind_data.column_types[schema_col];
+		if (!IsNativelyHandled(type)) {
+			result->cast_temp_vecs[out_idx] = make_uniq<Vector>(LogicalType::VARCHAR, STANDARD_VECTOR_SIZE);
+		}
+	}
+
 	if (!OpenNextFile(context, *result, bind_data)) {
 		result->finished = true;
 	}
@@ -346,16 +384,20 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				continue;
 			}
 
+			// For non-native columns (e.g. INET) we accumulate into a temp VARCHAR vector and
+			// batch-cast to the real output at end of chunk. For native columns target_vec == vec.
+			Vector &target_vec = state.cast_temp_vecs[out_idx] ? *state.cast_temp_vecs[out_idx] : vec;
+
 			// Out-of-range data column → NULL.
 			if (schema_col >= num_fields) {
-				FlatVector::SetNull(vec, row_count, true);
+				FlatVector::SetNull(target_vec, row_count, true);
 				continue;
 			}
 
 			const FieldSlice &field = state.field_slices[schema_col];
 
 			if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
-				FlatVector::SetNull(vec, row_count, true);
+				FlatVector::SetNull(target_vec, row_count, true);
 				continue;
 			}
 
@@ -434,14 +476,26 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				break;
 			}
 			default: {
-				vec.SetValue(row_count,
-				             Value(string(field.ptr, field.len)).CastAs(context, bind_data.column_types[schema_col]));
+				// Non-native type (e.g. INET): write the slice into the temp VARCHAR vector
+				// (target_vec is the temp). The batch cast at end of chunk converts to the real type.
+				FlatVector::GetData<string_t>(target_vec)[row_count] =
+				    StringVector::AddString(target_vec, field.ptr, field.len);
 				break;
 			}
 			}
 		}
 
 		row_count++;
+	}
+
+	// Batch-cast each non-native column's accumulated VARCHAR slices into its real output vector.
+	if (row_count > 0) {
+		for (idx_t out_idx = 0; out_idx < state.cast_temp_vecs.size(); out_idx++) {
+			if (!state.cast_temp_vecs[out_idx]) {
+				continue;
+			}
+			VectorOperations::Cast(context, *state.cast_temp_vecs[out_idx], output.data[out_idx], row_count);
+		}
 	}
 
 	output.SetCardinality(row_count);

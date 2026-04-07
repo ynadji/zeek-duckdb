@@ -98,6 +98,11 @@ struct ZeekScanGlobalState : public GlobalTableFunctionState {
 	//! True if no columns are projected (e.g. COUNT(*)) — skip all parsing
 	bool count_only = false;
 
+	//! For columns whose target type isn't natively handled (e.g. INET), we accumulate
+	//! string slices into a temporary VARCHAR vector and batch-cast at end of chunk.
+	//! Indexed by output column index; nullptr means the column is handled natively.
+	vector<unique_ptr<Vector>> cast_temp_vecs;
+
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded for now
 	}
