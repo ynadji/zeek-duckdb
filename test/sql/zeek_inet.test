@@ -25,3 +25,21 @@ query I
 SELECT typeof(host_ip) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz');
 ----
 INET
+
+# Filter on INET column — pushdown is disabled for INET so DuckDB applies it post-scan.
+# Verify this still produces correct results.
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz') WHERE id_orig_h = '10.20.40.41'::inet;
+----
+2
+
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz') WHERE id_orig_h = '127.0.0.1'::inet;
+----
+0
+
+# Mixed filter: native pushdown (proto) AND post-scan (INET).
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz') WHERE proto = 'udp' AND id_resp_h = '8.8.4.4'::inet;
+----
+2
