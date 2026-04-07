@@ -29,43 +29,43 @@ static interval_t SecondsToInterval(double seconds) {
 	return Interval::FromMicro(micros);
 }
 
-//! Read one line from the buffered file into state.line_buffer.
+//! Read one line from the buffered file into lstate.line_buffer.
 //! Returns false on EOF (with line_buffer empty).
-static bool ReadLineBuffered(ZeekScanGlobalState &state) {
-	state.line_buffer.clear();
+static bool ReadLineBuffered(ZeekScanLocalState &lstate) {
+	lstate.line_buffer.clear();
 
 	while (true) {
 		// Refill the read buffer if exhausted.
-		if (state.buffer_pos >= state.buffer_size) {
-			if (state.eof_reached) {
-				return !state.line_buffer.empty();
+		if (lstate.buffer_pos >= lstate.buffer_size) {
+			if (lstate.eof_reached) {
+				return !lstate.line_buffer.empty();
 			}
-			state.buffer_size = state.file_handle->Read(state.read_buffer.data(), state.read_buffer.size());
-			state.buffer_pos = 0;
-			if (state.buffer_size == 0) {
-				state.eof_reached = true;
-				return !state.line_buffer.empty();
+			lstate.buffer_size = lstate.file_handle->Read(lstate.read_buffer.data(), lstate.read_buffer.size());
+			lstate.buffer_pos = 0;
+			if (lstate.buffer_size == 0) {
+				lstate.eof_reached = true;
+				return !lstate.line_buffer.empty();
 			}
 		}
 
-		const char *start = state.read_buffer.data() + state.buffer_pos;
-		idx_t remaining = state.buffer_size - state.buffer_pos;
+		const char *start = lstate.read_buffer.data() + lstate.buffer_pos;
+		idx_t remaining = lstate.buffer_size - lstate.buffer_pos;
 		const char *newline = static_cast<const char *>(std::memchr(start, '\n', remaining));
 
 		if (newline) {
 			idx_t line_len = static_cast<idx_t>(newline - start);
-			state.line_buffer.insert(state.line_buffer.end(), start, start + line_len);
-			state.buffer_pos += line_len + 1;
+			lstate.line_buffer.insert(lstate.line_buffer.end(), start, start + line_len);
+			lstate.buffer_pos += line_len + 1;
 			// Strip trailing \r if present (handles \r\n line endings even across buffer boundaries).
-			if (!state.line_buffer.empty() && state.line_buffer.back() == '\r') {
-				state.line_buffer.pop_back();
+			if (!lstate.line_buffer.empty() && lstate.line_buffer.back() == '\r') {
+				lstate.line_buffer.pop_back();
 			}
 			return true;
 		}
 
 		// No newline in this buffer chunk — copy what we have and refill.
-		state.line_buffer.insert(state.line_buffer.end(), start, start + remaining);
-		state.buffer_pos = state.buffer_size;
+		lstate.line_buffer.insert(lstate.line_buffer.end(), start, start + remaining);
+		lstate.buffer_pos = lstate.buffer_size;
 	}
 }
 
@@ -237,34 +237,39 @@ static bool EvaluateFilter(const TableFilter &filter, const Value &val, bool is_
 	}
 }
 
-static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &state, const ZeekScanBindData &bind_data) {
+//! Atomically claim the next file from the shared queue and open it for the calling thread.
+//! Returns false if no more files remain.
+static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, ZeekScanLocalState &lstate,
+                         const ZeekScanBindData &bind_data) {
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	while (state.current_file_idx < bind_data.file_paths.size()) {
-		state.current_file_path = bind_data.file_paths[state.current_file_idx];
-		state.current_file_idx++;
+	while (true) {
+		idx_t my_file_idx = gstate.next_file_idx.fetch_add(1, std::memory_order_relaxed);
+		if (my_file_idx >= bind_data.file_paths.size()) {
+			return false;
+		}
 
-		state.file_handle =
-		    fs.OpenFile(state.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+		lstate.current_file_path = bind_data.file_paths[my_file_idx];
+		lstate.file_handle =
+		    fs.OpenFile(lstate.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 
 		// Reset buffer state for the new file.
-		state.buffer_pos = 0;
-		state.buffer_size = 0;
-		state.eof_reached = false;
+		lstate.buffer_pos = 0;
+		lstate.buffer_size = 0;
+		lstate.eof_reached = false;
 
 		// Skip header lines using the buffered reader.
 		idx_t lines_to_skip = bind_data.header.header_line_count;
 		for (idx_t i = 0; i < lines_to_skip; i++) {
-			if (!ReadLineBuffered(state)) {
+			if (!ReadLineBuffered(lstate)) {
 				break;
 			}
 		}
 		return true;
 	}
-	return false;
 }
 
-static void AppendListValue(ClientContext &context, ZeekScanGlobalState &state, Vector &vec, idx_t row_idx,
+static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, Vector &vec, idx_t row_idx,
                             const FieldSlice &field, char set_separator, const LogicalType &child_type,
                             const string &unset_field, const string &empty_field) {
 	auto &list_entry = ListVector::GetData(vec)[row_idx];
@@ -276,8 +281,8 @@ static void AppendListValue(ClientContext &context, ZeekScanGlobalState &state, 
 		return;
 	}
 
-	TokenizeSpan(field.ptr, field.len, set_separator, state.list_element_slices);
-	auto &elements = state.list_element_slices;
+	TokenizeSpan(field.ptr, field.len, set_separator, lstate.list_element_slices);
+	auto &elements = lstate.list_element_slices;
 
 	list_entry.offset = current_size;
 	list_entry.length = elements.size();
@@ -430,8 +435,7 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 	auto &bind_data = input.bind_data->Cast<ZeekScanBindData>();
 	auto result = make_uniq<ZeekScanGlobalState>();
 
-	// Allocate the read buffer.
-	result->read_buffer.resize(READ_BUFFER_SIZE);
+	result->total_files = bind_data.file_paths.size();
 
 	// Resolve projection: which schema columns does the query actually want?
 	// column_ids is provided by DuckDB when projection_pushdown = true.
@@ -444,30 +448,43 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 		}
 	}
 
-	// For each projected column whose type isn't natively handled (e.g. INET),
-	// allocate a temporary VARCHAR vector so we can batch-cast at end of chunk.
+	// For each projected column, decide whether it needs the batched cast path. Threads will
+	// each allocate their own temp vectors based on this list.
 	const idx_t data_col_count = bind_data.column_types.size();
-	result->cast_temp_vecs.resize(result->projected_schema_cols.size());
+	result->needs_cast_buffer.resize(result->projected_schema_cols.size(), false);
 	for (idx_t out_idx = 0; out_idx < result->projected_schema_cols.size(); out_idx++) {
 		column_t schema_col = result->projected_schema_cols[out_idx];
-		// Filename virtual column is always VARCHAR — handled natively.
 		if (bind_data.filename_column && schema_col == data_col_count) {
 			continue;
 		}
 		if (schema_col >= data_col_count) {
 			continue;
 		}
-		const auto &type = bind_data.column_types[schema_col];
-		if (!IsNativelyHandled(type)) {
-			result->cast_temp_vecs[out_idx] = make_uniq<Vector>(LogicalType::VARCHAR, STANDARD_VECTOR_SIZE);
+		if (!IsNativelyHandled(bind_data.column_types[schema_col])) {
+			result->needs_cast_buffer[out_idx] = true;
 		}
 	}
 
 	// Capture any pushed-down filters for per-row evaluation.
 	result->filters = input.filters;
 
-	if (!OpenNextFile(context, *result, bind_data)) {
-		result->finished = true;
+	return std::move(result);
+}
+
+static unique_ptr<LocalTableFunctionState>
+ZeekScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+	auto &gstate = global_state->Cast<ZeekScanGlobalState>();
+	auto result = make_uniq<ZeekScanLocalState>();
+
+	// Allocate this thread's read buffer.
+	result->read_buffer.resize(READ_BUFFER_SIZE);
+
+	// Allocate per-thread cast temp vectors based on global state's needs_cast_buffer.
+	result->cast_temp_vecs.resize(gstate.needs_cast_buffer.size());
+	for (idx_t out_idx = 0; out_idx < gstate.needs_cast_buffer.size(); out_idx++) {
+		if (gstate.needs_cast_buffer[out_idx]) {
+			result->cast_temp_vecs[out_idx] = make_uniq<Vector>(LogicalType::VARCHAR, STANDARD_VECTOR_SIZE);
+		}
 	}
 
 	return std::move(result);
@@ -475,9 +492,10 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 
 static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<ZeekScanBindData>();
-	auto &state = data.global_state->Cast<ZeekScanGlobalState>();
+	auto &gstate = data.global_state->Cast<ZeekScanGlobalState>();
+	auto &lstate = data.local_state->Cast<ZeekScanLocalState>();
 
-	if (state.finished) {
+	if (lstate.finished) {
 		output.SetCardinality(0);
 		return;
 	}
@@ -490,42 +508,48 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 	const char field_separator = bind_data.header.separator;
 
 	while (row_count < STANDARD_VECTOR_SIZE) {
-		if (!ReadLineBuffered(state)) {
-			if (!OpenNextFile(context, state, bind_data)) {
-				state.finished = true;
+		// Open the first/next file if this thread doesn't currently have one.
+		if (!lstate.file_handle) {
+			if (!OpenNextFile(context, gstate, lstate, bind_data)) {
+				lstate.finished = true;
 				break;
 			}
+		}
+
+		if (!ReadLineBuffered(lstate)) {
+			// EOF on current file — release it and try the next.
+			lstate.file_handle.reset();
 			continue;
 		}
 
 		// Skip empty lines and Zeek metadata comment lines.
-		if (state.line_buffer.empty() || state.line_buffer[0] == '#') {
+		if (lstate.line_buffer.empty() || lstate.line_buffer[0] == '#') {
 			continue;
 		}
 
 		// COUNT(*) fast path: no columns needed, just count rows.
-		if (state.count_only) {
+		if (gstate.count_only) {
 			row_count++;
 			continue;
 		}
 
 		// Tokenize the line into field slices (reused vector — no allocation per row in steady state).
-		TokenizeSpan(state.line_buffer.data(), static_cast<uint32_t>(state.line_buffer.size()), field_separator,
-		             state.field_slices);
-		const idx_t num_fields = state.field_slices.size();
+		TokenizeSpan(lstate.line_buffer.data(), static_cast<uint32_t>(lstate.line_buffer.size()), field_separator,
+		             lstate.field_slices);
+		const idx_t num_fields = lstate.field_slices.size();
 
 		// Evaluate pushed-down filters on this row. If any filter fails, skip the entire row
 		// without parsing the non-filter projected columns.
-		if (state.filters) {
+		if (gstate.filters) {
 			bool row_passes = true;
-			for (auto &entry : state.filters->filters) {
+			for (auto &entry : gstate.filters->filters) {
 				idx_t filter_out_idx = entry.first; // index into projected_schema_cols
 				const TableFilter &filter = *entry.second;
-				column_t schema_col = state.projected_schema_cols[filter_out_idx];
+				column_t schema_col = gstate.projected_schema_cols[filter_out_idx];
 
 				// Filename virtual column filter (VARCHAR).
 				if (bind_data.filename_column && schema_col == filename_col_idx) {
-					Value v(state.current_file_path);
+					Value v(lstate.current_file_path);
 					if (!EvaluateFilter(filter, v, false)) {
 						row_passes = false;
 						break;
@@ -543,7 +567,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 					continue;
 				}
 
-				const FieldSlice &field = state.field_slices[schema_col];
+				const FieldSlice &field = lstate.field_slices[schema_col];
 
 				// Unset/empty marker → treat as NULL.
 				if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
@@ -568,19 +592,19 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 		}
 
 		// Walk projected output columns and emit values for those.
-		for (idx_t out_idx = 0; out_idx < state.projected_schema_cols.size(); out_idx++) {
-			column_t schema_col = state.projected_schema_cols[out_idx];
+		for (idx_t out_idx = 0; out_idx < gstate.projected_schema_cols.size(); out_idx++) {
+			column_t schema_col = gstate.projected_schema_cols[out_idx];
 			auto &vec = output.data[out_idx];
 
 			// Filename virtual column.
 			if (bind_data.filename_column && schema_col == filename_col_idx) {
-				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, state.current_file_path);
+				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, lstate.current_file_path);
 				continue;
 			}
 
 			// For non-native columns (e.g. INET) we accumulate into a temp VARCHAR vector and
 			// batch-cast to the real output at end of chunk. For native columns target_vec == vec.
-			Vector &target_vec = state.cast_temp_vecs[out_idx] ? *state.cast_temp_vecs[out_idx] : vec;
+			Vector &target_vec = lstate.cast_temp_vecs[out_idx] ? *lstate.cast_temp_vecs[out_idx] : vec;
 
 			// Out-of-range data column → NULL.
 			if (schema_col >= num_fields) {
@@ -588,7 +612,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				continue;
 			}
 
-			const FieldSlice &field = state.field_slices[schema_col];
+			const FieldSlice &field = lstate.field_slices[schema_col];
 
 			if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
 				FlatVector::SetNull(target_vec, row_count, true);
@@ -665,7 +689,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			}
 			case LogicalTypeId::LIST: {
 				auto &child_type = ListType::GetChildType(bind_data.column_types[schema_col]);
-				AppendListValue(context, state, vec, row_count, field, bind_data.header.set_separator, child_type,
+				AppendListValue(context, lstate, vec, row_count, field, bind_data.header.set_separator, child_type,
 				                unset_field, empty_field);
 				break;
 			}
@@ -684,11 +708,11 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 	// Batch-cast each non-native column's accumulated VARCHAR slices into its real output vector.
 	if (row_count > 0) {
-		for (idx_t out_idx = 0; out_idx < state.cast_temp_vecs.size(); out_idx++) {
-			if (!state.cast_temp_vecs[out_idx]) {
+		for (idx_t out_idx = 0; out_idx < lstate.cast_temp_vecs.size(); out_idx++) {
+			if (!lstate.cast_temp_vecs[out_idx]) {
 				continue;
 			}
-			VectorOperations::Cast(context, *state.cast_temp_vecs[out_idx], output.data[out_idx], row_count);
+			VectorOperations::Cast(context, *lstate.cast_temp_vecs[out_idx], output.data[out_idx], row_count);
 		}
 	}
 
@@ -707,7 +731,8 @@ static bool ZeekSupportsPushdownType(const FunctionData &bind_data_p, idx_t col_
 }
 
 TableFunction GetZeekScanFunction() {
-	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal);
+	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal,
+	                   ZeekScanInitLocal);
 	func.named_parameters["filename"] = LogicalType::BOOLEAN;
 	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
 	func.named_parameters["inet"] = LogicalType::BOOLEAN;
