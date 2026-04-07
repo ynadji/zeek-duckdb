@@ -6,6 +6,12 @@
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 
 #include <cstring>
 
@@ -96,6 +102,138 @@ static bool IsNativelyHandled(const LogicalType &type) {
 		return true;
 	default:
 		return false;
+	}
+}
+
+//! Returns true if filter pushdown is efficient for this column type (see supports_pushdown_type).
+//! We only advertise pushdown for types we can parse from a slice without going through an
+//! extension cast — LIST and INET are excluded because per-row evaluation would be slower than
+//! letting DuckDB filter post-scan.
+static bool CanPushdownFilterOnType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::INTERVAL:
+	case LogicalTypeId::USMALLINT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! Parse a slice into a DuckDB Value of the given type. Returns a NULL Value of the target type
+//! on parse failure. This is only called for filter columns and only for types where
+//! CanPushdownFilterOnType returns true.
+static Value SliceToValue(const FieldSlice &field, const LogicalType &type) {
+	string_t s(field.ptr, field.len);
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR:
+		return Value(string(field.ptr, field.len));
+	case LogicalTypeId::DOUBLE: {
+		double v;
+		if (TryCast::Operation<string_t, double>(s, v)) {
+			return Value::DOUBLE(v);
+		}
+		return Value(type);
+	}
+	case LogicalTypeId::UBIGINT: {
+		uint64_t v;
+		if (TryCast::Operation<string_t, uint64_t>(s, v)) {
+			return Value::UBIGINT(v);
+		}
+		return Value(type);
+	}
+	case LogicalTypeId::BIGINT: {
+		int64_t v;
+		if (TryCast::Operation<string_t, int64_t>(s, v)) {
+			return Value::BIGINT(v);
+		}
+		return Value(type);
+	}
+	case LogicalTypeId::BOOLEAN: {
+		bool b = (field.len == 1 && field.ptr[0] == 'T') ||
+		         (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
+		return Value::BOOLEAN(b);
+	}
+	case LogicalTypeId::USMALLINT: {
+		uint16_t v;
+		if (TryCast::Operation<string_t, uint16_t>(s, v)) {
+			return Value::USMALLINT(v);
+		}
+		return Value(type);
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		double v;
+		if (TryCast::Operation<string_t, double>(s, v)) {
+			return Value::TIMESTAMPTZ(EpochSecondsToTimestampTZ(v));
+		}
+		return Value(type);
+	}
+	case LogicalTypeId::INTERVAL: {
+		double v;
+		if (TryCast::Operation<string_t, double>(s, v)) {
+			return Value::INTERVAL(SecondsToInterval(v));
+		}
+		return Value(type);
+	}
+	default:
+		// Should never be reached — CanPushdownFilterOnType restricts the types we see here.
+		return Value(type);
+	}
+}
+
+//! Evaluate a filter against a value. `is_null` indicates whether `val` represents a SQL NULL
+//! (Value is not null-tagged otherwise). Returns true if the row passes the filter.
+static bool EvaluateFilter(const TableFilter &filter, const Value &val, bool is_null) {
+	switch (filter.filter_type) {
+	case TableFilterType::IS_NULL:
+		return is_null;
+	case TableFilterType::IS_NOT_NULL:
+		return !is_null;
+	case TableFilterType::CONSTANT_COMPARISON: {
+		if (is_null) {
+			// NULL compared with anything is NULL → row filtered out.
+			return false;
+		}
+		return filter.Cast<ConstantFilter>().Compare(val);
+	}
+	case TableFilterType::IN_FILTER: {
+		if (is_null) {
+			return false;
+		}
+		auto &in_filter = filter.Cast<InFilter>();
+		for (auto &v : in_filter.values) {
+			if (!v.IsNull() && ValueOperations::Equals(v, val)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child : conj.child_filters) {
+			if (!EvaluateFilter(*child, val, is_null)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		for (auto &child : conj.child_filters) {
+			if (EvaluateFilter(*child, val, is_null)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		// Unknown filter type — be safe: let the row through, DuckDB will re-evaluate post-scan.
+		return true;
 	}
 }
 
@@ -325,6 +463,9 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 		}
 	}
 
+	// Capture any pushed-down filters for per-row evaluation.
+	result->filters = input.filters;
+
 	if (!OpenNextFile(context, *result, bind_data)) {
 		result->finished = true;
 	}
@@ -372,6 +513,59 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 		TokenizeSpan(state.line_buffer.data(), static_cast<uint32_t>(state.line_buffer.size()), field_separator,
 		             state.field_slices);
 		const idx_t num_fields = state.field_slices.size();
+
+		// Evaluate pushed-down filters on this row. If any filter fails, skip the entire row
+		// without parsing the non-filter projected columns.
+		if (state.filters) {
+			bool row_passes = true;
+			for (auto &entry : state.filters->filters) {
+				idx_t filter_out_idx = entry.first; // index into projected_schema_cols
+				const TableFilter &filter = *entry.second;
+				column_t schema_col = state.projected_schema_cols[filter_out_idx];
+
+				// Filename virtual column filter (VARCHAR).
+				if (bind_data.filename_column && schema_col == filename_col_idx) {
+					Value v(state.current_file_path);
+					if (!EvaluateFilter(filter, v, false)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
+				// Missing field → treat as NULL.
+				if (schema_col >= num_fields) {
+					Value null_val(bind_data.column_types[schema_col]);
+					if (!EvaluateFilter(filter, null_val, true)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
+				const FieldSlice &field = state.field_slices[schema_col];
+
+				// Unset/empty marker → treat as NULL.
+				if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
+					Value null_val(bind_data.column_types[schema_col]);
+					if (!EvaluateFilter(filter, null_val, true)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
+				// Parse the slice into a Value of the column's type and evaluate.
+				Value row_val = SliceToValue(field, bind_data.column_types[schema_col]);
+				if (!EvaluateFilter(filter, row_val, row_val.IsNull())) {
+					row_passes = false;
+					break;
+				}
+			}
+			if (!row_passes) {
+				continue;
+			}
+		}
 
 		// Walk projected output columns and emit values for those.
 		for (idx_t out_idx = 0; out_idx < state.projected_schema_cols.size(); out_idx++) {
@@ -501,12 +695,25 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 	output.SetCardinality(row_count);
 }
 
+//! Callback: can we push down a filter on the given (schema) column index?
+//! We return true only for types we can cheaply parse from a slice per-row.
+static bool ZeekSupportsPushdownType(const FunctionData &bind_data_p, idx_t col_idx) {
+	auto &bind_data = bind_data_p.Cast<ZeekScanBindData>();
+	// The filename virtual column is always VARCHAR; filters on it are cheap.
+	if (col_idx >= bind_data.column_types.size()) {
+		return true;
+	}
+	return CanPushdownFilterOnType(bind_data.column_types[col_idx]);
+}
+
 TableFunction GetZeekScanFunction() {
 	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal);
 	func.named_parameters["filename"] = LogicalType::BOOLEAN;
 	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
 	func.named_parameters["inet"] = LogicalType::BOOLEAN;
 	func.projection_pushdown = true;
+	func.filter_pushdown = true;
+	func.supports_pushdown_type = ZeekSupportsPushdownType;
 	return func;
 }
 

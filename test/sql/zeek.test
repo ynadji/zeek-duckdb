@@ -105,3 +105,103 @@ query I
 SELECT typeof(host_ip) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false);
 ----
 VARCHAR
+
+# ================================================================
+# Filter pushdown tests
+# ================================================================
+
+# Equality filter on VARCHAR column (pushed down)
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE proto = 'udp';
+----
+2
+
+# Equality filter that matches no rows
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE proto = 'tcp';
+----
+0
+
+# Equality filter on USMALLINT column
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p = 51168;
+----
+1
+
+# Range filter on USMALLINT column
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p > 50000;
+----
+1
+
+# Range filter on TIMESTAMP_TZ column
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE ts > '2026-01-01'::timestamptz;
+----
+2
+
+# IN filter on VARCHAR column
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE proto IN ('udp', 'tcp');
+----
+2
+
+# IN filter that matches no rows
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE proto IN ('icmp', 'tcp');
+----
+0
+
+# IN filter on USMALLINT
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p IN (51168, 49581);
+----
+2
+
+# Conjunction (AND) of filters on different columns
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE proto = 'udp' AND id_orig_p = 51168;
+----
+1
+
+# Disjunction (OR) of filters on same column (pushed down as OR)
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p = 51168 OR id_orig_p = 49581;
+----
+2
+
+# Disjunction where only one branch matches
+query I
+SELECT COUNT(*) FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p = 51168 OR id_orig_p = 99999;
+----
+1
+
+# Filter on projected column — returned value should match
+query II
+SELECT id_orig_p, proto FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p = 51168;
+----
+51168	udp
+
+# Filter on column not in projection — DuckDB must include it in column_ids
+query I
+SELECT uid FROM read_zeek('data/dns.log.gz', inet=false) WHERE id_orig_p = 49581;
+----
+C61GeE23uDUeX311zl
+
+# IS NULL filter (host_inner_vlan is unset '-' in known_hosts)
+query I
+SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false) WHERE host_inner_vlan IS NULL;
+----
+1
+
+# IS NOT NULL filter
+query I
+SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false) WHERE host_inner_vlan IS NOT NULL;
+----
+0
+
+# IS NOT NULL on a column that is always set
+query I
+SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false) WHERE host_vlan IS NOT NULL;
+----
+1

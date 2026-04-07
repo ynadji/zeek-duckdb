@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/table_filter.hpp"
 
 #include <string>
 #include <vector>
@@ -102,6 +103,10 @@ struct ZeekScanGlobalState : public GlobalTableFunctionState {
 	//! string slices into a temporary VARCHAR vector and batch-cast at end of chunk.
 	//! Indexed by output column index; nullptr means the column is handled natively.
 	vector<unique_ptr<Vector>> cast_temp_vecs;
+
+	//! Pushed-down filters from DuckDB. The map key is the index into projected_schema_cols
+	//! (i.e. the output column index), NOT the schema column index. Null if no filters pushed down.
+	optional_ptr<TableFilterSet> filters;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded for now
