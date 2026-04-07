@@ -48,20 +48,42 @@ public:
 	static bool ReadLine(FileHandle &file_handle, string &line);
 
 	static string ExtractInnerType(const string &zeek_type);
+
+	//! Apply a single header line to a ZeekHeader. Returns true if the line was a directive
+	//! (i.e. starts with '#') and was consumed; false if it was a data line. Does not modify
+	//! `header` if it returns false.
+	static bool ApplyHeaderLine(const char *line, idx_t len, ZeekHeader &header);
 };
+
+//! Compare two parsed headers for schema equivalence. Returns true if they describe the same
+//! Zeek log schema. On mismatch, populates `mismatch_reason` with a brief human-readable
+//! description of the first difference found and returns false. The fields compared are:
+//! `fields`, `types`, `separator`, `set_separator`, `unset_field`, `empty_field`. The
+//! `path` and `open_time` fields are intentionally ignored.
+bool SameSchema(const ZeekHeader &expected, const ZeekHeader &actual, string &mismatch_reason);
 
 //! Bind data for the read_zeek table function
 struct ZeekScanBindData : public TableFunctionData {
 	//! List of file paths (expanded from glob)
 	vector<string> file_paths;
-	//! Parsed header information (from first file, used as schema)
+	//! Parsed header information. In strict mode this is file 0's header. In union mode the
+	//! `fields` and `types` vectors contain the union of all files' fields, in the order they
+	//! were first encountered (file 0's fields first, then any new fields from file 1, etc.).
 	ZeekHeader header;
-	//! DuckDB types for each column
+	//! DuckDB types for each column (size matches header.fields).
 	vector<LogicalType> column_types;
 	//! Whether to add a filename column
 	bool filename_column = false;
 	//! Whether to use INET type for addr/subnet (requires inet extension)
 	bool use_inet = true;
+	//! Whether to union schemas across files. When true, the output schema is the union of all
+	//! files' fields and missing fields become NULL. When false (default) all files must have
+	//! identical schemas — any mismatch is an error.
+	bool union_by_name = false;
+	//! When union_by_name=true: per-file inverse mapping. union_to_file_field[file_idx][union_col]
+	//! gives the field index within that file for the given union column, or idx_t(-1) if the
+	//! field is absent from this file. Empty when union_by_name=false.
+	vector<vector<idx_t>> union_to_file_field;
 };
 
 //! A view into a contiguous span of bytes (no ownership)
@@ -103,8 +125,16 @@ struct ZeekScanLocalState : public LocalTableFunctionState {
 	unique_ptr<FileHandle> file_handle;
 	//! Path of the currently-open file (for filename column).
 	string current_file_path;
+	//! Index into bind_data.file_paths for the currently-open file.
+	idx_t current_file_idx = 0;
 	//! True when this thread has no more files to process.
 	bool finished = false;
+
+	//! For each schema column index (in the bound output schema), the index of that field in the
+	//! currently-open file's row layout — or idx_t(-1) if the field is absent from this file
+	//! (only possible in union_by_name mode). In strict mode this is always the identity mapping.
+	//! Re-populated each time OpenNextFile claims a new file.
+	vector<idx_t> field_lookup;
 
 	//! Buffered I/O: raw bytes read from the file.
 	vector<char> read_buffer;
@@ -114,6 +144,10 @@ struct ZeekScanLocalState : public LocalTableFunctionState {
 
 	//! Current line, accumulated across buffer refills if needed.
 	vector<char> line_buffer;
+	//! When true, line_buffer holds a line that was already read but not yet consumed by the
+	//! caller (e.g., the first data line peeked at by the per-file header parser). The next
+	//! call to ReadLineBuffered will return this line as-is and clear the flag.
+	bool has_pending_line = false;
 	//! Field slices into line_buffer (reused per row).
 	vector<FieldSlice> field_slices;
 	//! Element slices for LIST values (reused per LIST cell).

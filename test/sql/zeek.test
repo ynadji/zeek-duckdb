@@ -205,3 +205,97 @@ query I
 SELECT COUNT(*) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.00-0500.log.gz', inet=false) WHERE host_vlan IS NOT NULL;
 ----
 1
+
+# ================================================================
+# Schema validation across globbed files
+# ================================================================
+
+# Two files in the same dir with the same schema → reads all rows from both
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_match/*.log', inet=false);
+----
+3
+
+# Reading a single file works regardless of validation
+query III
+SELECT ts, id, value FROM read_zeek('data/schema_match/a.log', inet=false) ORDER BY id;
+----
+2026-01-16 05:19:49+00	A1	10
+2026-01-16 05:19:50+00	A2	20
+
+# Glob over files with different field counts → error naming both files and the mismatch
+statement error
+SELECT * FROM read_zeek('data/schema_extra/*.log', inet=false);
+----
+different field count
+
+# Glob over files with reordered fields → error
+statement error
+SELECT * FROM read_zeek('data/schema_reorder/*.log', inet=false);
+----
+field 0 differs
+
+# Glob over files with a type mismatch on a shared field → error
+statement error
+SELECT * FROM read_zeek('data/schema_type/*.log', inet=false);
+----
+type for field 'value' differs
+
+# ================================================================
+# union_by_name: schema union across files with different fields
+# ================================================================
+
+# Total row count across both files
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true);
+----
+4
+
+# Union schema has 5 columns (ts, id, value, extra, newfield)
+query I
+SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true));
+----
+5
+
+# Old-file rows have NULL for fields only present in the new file
+query II
+SELECT COUNT(*), COUNT(extra) FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true) WHERE id LIKE 'A%';
+----
+2	0
+
+# New-file rows have non-NULL values for the new fields
+query III
+SELECT id, extra, newfield FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true) WHERE id LIKE 'B%' ORDER BY id;
+----
+B1	hello	true
+B2	world	false
+
+# Filter on a shared field (proto-style) works in union mode
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true) WHERE value > 15;
+----
+3
+
+# IS NULL filter on a union-only field selects only the rows from files missing that field
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true) WHERE extra IS NULL;
+----
+2
+
+# IS NOT NULL filter on a union-only field selects only the rows from files that have it
+query I
+SELECT COUNT(*) FROM read_zeek('data/schema_union_overlap/*.log', inet=false, union_by_name=true) WHERE extra IS NOT NULL;
+----
+2
+
+# Strict mode (default) on the same files still errors
+statement error
+SELECT * FROM read_zeek('data/schema_union_overlap/*.log', inet=false);
+----
+different field count
+
+# Type conflict: same field name with a different Zeek type → bind-time error
+statement error
+SELECT * FROM read_zeek('data/schema_union_typeconflict/*.log', inet=false, union_by_name=true);
+----
+field 'value' has type

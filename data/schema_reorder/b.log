@@ -1,0 +1,9 @@
+#separator 	
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#path	test
+#fields	id	ts	value
+#types	string	time	count
+C1	1768540791.000000	40
+#close	2026-01-16-02-00-00
