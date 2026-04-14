@@ -1,0 +1,75 @@
+# name: test/sql/zeek_ignore_file_errors.test
+# description: test ignore_file_errors parameter
+# group: [sql]
+
+require zeek
+
+# ================================================================
+# Test ignore_file_errors parameter
+# ================================================================
+
+# Without ignore_file_errors, reading a corrupted file should fail
+statement error
+SELECT * FROM read_zeek('data/error_test/corrupted.log.gz', inet=false);
+----
+Input is not a GZIP stream
+
+# Without ignore_file_errors, reading a fake gzip file should fail
+statement error
+SELECT * FROM read_zeek('data/error_test/fake_gzip.log.gz', inet=false);
+----
+
+# With ignore_file_errors=true on a single corrupted file, still throws error (needs at least one valid file for schema)
+statement error
+SELECT COUNT(*) FROM read_zeek('data/error_test/corrupted.log.gz', inet=false, ignore_file_errors=true);
+----
+No valid Zeek log files found in pattern
+
+# With ignore_file_errors=true on a fake gzip file, still throws error (needs at least one valid file for schema)
+statement error
+SELECT COUNT(*) FROM read_zeek('data/error_test/fake_gzip.log.gz', inet=false, ignore_file_errors=true);
+----
+No valid Zeek log files found in pattern
+
+# Read valid file without ignore_file_errors
+query III
+SELECT ts, id, value FROM read_zeek('data/error_test/valid.log.gz', inet=false) ORDER BY id;
+----
+2025-01-16 04:59:50.123456+00	A1	100
+2025-01-16 04:59:51.123456+00	A2	200
+
+# Read glob with mix of valid and corrupted files WITHOUT ignore_file_errors - should fail
+statement error
+SELECT * FROM read_zeek('data/error_test/*.log.gz', inet=false);
+----
+
+# Read glob with mix of valid and corrupted files WITH ignore_file_errors - should only read valid files
+query III
+SELECT ts, id, value FROM read_zeek('data/error_test/*.log.gz', inet=false, ignore_file_errors=true) ORDER BY id;
+----
+2025-01-16 04:59:50.123456+00	A1	100
+2025-01-16 04:59:51.123456+00	A2	200
+2025-01-16 04:59:52.123456+00	A3	300
+
+# Count all rows from valid files only, ignoring corrupted ones
+query I
+SELECT COUNT(*) FROM read_zeek('data/error_test/*.log.gz', inet=false, ignore_file_errors=true);
+----
+3
+
+# Verify that with ignore_file_errors=false (default), the glob still fails on corrupted files
+statement error
+SELECT COUNT(*) FROM read_zeek('data/error_test/*.log.gz', inet=false, ignore_file_errors=false);
+----
+
+# Test ignore_file_errors with union_by_name
+query I
+SELECT COUNT(*) FROM read_zeek('data/error_test/*.log.gz', inet=false, ignore_file_errors=true, union_by_name=true);
+----
+3
+
+# Test with filename column to see which files were read
+query I
+SELECT COUNT(DISTINCT filename) FROM read_zeek('data/error_test/*.log.gz', inet=false, ignore_file_errors=true, filename=true);
+----
+2

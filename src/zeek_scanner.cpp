@@ -256,61 +256,74 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 
 		lstate.current_file_idx = my_file_idx;
 		lstate.current_file_path = bind_data.file_paths[my_file_idx];
-		lstate.file_handle =
-		    fs.OpenFile(lstate.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 
-		// Reset buffer state for the new file.
-		lstate.buffer_pos = 0;
-		lstate.buffer_size = 0;
-		lstate.eof_reached = false;
-		lstate.has_pending_line = false;
+		try {
+			lstate.file_handle =
+			    fs.OpenFile(lstate.current_file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 
-		// Parse this file's header via the buffered reader. We read lines until we hit the first
-		// non-directive (data) line, parse each `#` line as a directive, and leave the first data
-		// line in line_buffer with has_pending_line=true so the hot loop can consume it without
-		// re-reading.
-		ZeekHeader file_header;
-		while (ReadLineBuffered(lstate)) {
-			if (!ZeekReader::ApplyHeaderLine(lstate.line_buffer.data(), lstate.line_buffer.size(), file_header)) {
-				lstate.has_pending_line = true;
-				break;
+			// Reset buffer state for the new file.
+			lstate.buffer_pos = 0;
+			lstate.buffer_size = 0;
+			lstate.eof_reached = false;
+			lstate.has_pending_line = false;
+
+			// Parse this file's header via the buffered reader. We read lines until we hit the first
+			// non-directive (data) line, parse each `#` line as a directive, and leave the first data
+			// line in line_buffer with has_pending_line=true so the hot loop can consume it without
+			// re-reading.
+			ZeekHeader file_header;
+			while (ReadLineBuffered(lstate)) {
+				if (!ZeekReader::ApplyHeaderLine(lstate.line_buffer.data(), lstate.line_buffer.size(), file_header)) {
+					lstate.has_pending_line = true;
+					break;
+				}
+			}
+
+			if (file_header.fields.empty()) {
+				throw InvalidInputException("read_zeek: file '%s' is missing #fields directive", lstate.current_file_path);
+			}
+			if (file_header.types.empty()) {
+				throw InvalidInputException("read_zeek: file '%s' is missing #types directive", lstate.current_file_path);
+			}
+			if (file_header.fields.size() != file_header.types.size()) {
+				throw InvalidInputException("read_zeek: file '%s' has mismatched #fields and #types counts",
+				                            lstate.current_file_path);
+			}
+
+			// In strict mode, the bound schema must match this file exactly.
+			if (!bind_data.union_by_name) {
+				string mismatch;
+				if (!SameSchema(bind_data.header, file_header, mismatch)) {
+					throw InvalidInputException(
+					    "read_zeek: file '%s' has a different schema than '%s' (the first file in the glob): %s",
+					    lstate.current_file_path, bind_data.file_paths[0], mismatch);
+				}
+			}
+
+			// Build the per-file field lookup table used by the hot loop.
+			// Strict mode: identity mapping (schema_col == field_idx_in_file).
+			// Union mode: copy from the precomputed inverse mapping.
+			const idx_t bound_col_count = bind_data.header.fields.size();
+			if (bind_data.union_by_name) {
+				lstate.field_lookup = bind_data.union_to_file_field[my_file_idx];
+			} else {
+				lstate.field_lookup.resize(bound_col_count);
+				for (idx_t i = 0; i < bound_col_count; i++) {
+					lstate.field_lookup[i] = i;
+				}
+			}
+			return true;
+		} catch (const std::exception &e) {
+			// If ignore_file_errors is enabled, skip this file and try the next one.
+			// Otherwise, re-throw the exception to fail the query.
+			if (bind_data.ignore_file_errors) {
+				// Close any partially-opened file handle and continue to the next file.
+				lstate.file_handle.reset();
+				continue;
+			} else {
+				throw;
 			}
 		}
-
-		if (file_header.fields.empty()) {
-			throw InvalidInputException("read_zeek: file '%s' is missing #fields directive", lstate.current_file_path);
-		}
-		if (file_header.types.empty()) {
-			throw InvalidInputException("read_zeek: file '%s' is missing #types directive", lstate.current_file_path);
-		}
-		if (file_header.fields.size() != file_header.types.size()) {
-			throw InvalidInputException("read_zeek: file '%s' has mismatched #fields and #types counts",
-			                            lstate.current_file_path);
-		}
-
-		// In strict mode, the bound schema must match this file exactly.
-		if (!bind_data.union_by_name) {
-			string mismatch;
-			if (!SameSchema(bind_data.header, file_header, mismatch)) {
-				throw InvalidInputException(
-				    "read_zeek: file '%s' has a different schema than '%s' (the first file in the glob): %s",
-				    lstate.current_file_path, bind_data.file_paths[0], mismatch);
-			}
-		}
-
-		// Build the per-file field lookup table used by the hot loop.
-		// Strict mode: identity mapping (schema_col == field_idx_in_file).
-		// Union mode: copy from the precomputed inverse mapping.
-		const idx_t bound_col_count = bind_data.header.fields.size();
-		if (bind_data.union_by_name) {
-			lstate.field_lookup = bind_data.union_to_file_field[my_file_idx];
-		} else {
-			lstate.field_lookup.resize(bound_col_count);
-			for (idx_t i = 0; i < bound_col_count; i++) {
-				lstate.field_lookup[i] = i;
-			}
-		}
-		return true;
 	}
 }
 
@@ -458,11 +471,36 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		result->union_by_name = union_by_name_param->second.GetValue<bool>();
 	}
 
+	auto ignore_file_errors_param = input.named_parameters.find("ignore_file_errors");
+	if (ignore_file_errors_param != input.named_parameters.end()) {
+		result->ignore_file_errors = ignore_file_errors_param->second.GetValue<bool>();
+	}
+
 	if (!result->union_by_name) {
 		// Strict mode: parse only the first file's header. Per-file validation happens at scan time.
-		auto file_handle =
-		    fs.OpenFile(result->file_paths[0], FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
-		result->header = ZeekReader::ParseHeader(*file_handle);
+		// If ignore_file_errors is enabled, try each file until we find one that works.
+		bool found_valid_file = false;
+		for (idx_t file_idx = 0; file_idx < result->file_paths.size(); file_idx++) {
+			try {
+				auto file_handle = fs.OpenFile(result->file_paths[file_idx],
+				                               FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+				result->header = ZeekReader::ParseHeader(*file_handle);
+				found_valid_file = true;
+				break;
+			} catch (const std::exception &e) {
+				if (!result->ignore_file_errors) {
+					throw;
+				}
+				// Skip this file and try the next one
+			}
+		}
+		if (!found_valid_file) {
+			if (result->ignore_file_errors) {
+				throw IOException("No valid Zeek log files found in pattern: %s", pattern);
+			} else {
+				throw IOException("No files found matching pattern: %s", pattern);
+			}
+		}
 	} else {
 		// Union mode: open every file, parse its header, build the union schema and per-file
 		// inverse mappings. Same field name + different Zeek type → bind-time error.
@@ -471,9 +509,19 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		bool first_file = true;
 
 		for (idx_t file_idx = 0; file_idx < result->file_paths.size(); file_idx++) {
-			auto file_handle = fs.OpenFile(result->file_paths[file_idx],
-			                               FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
-			ZeekHeader file_header = ZeekReader::ParseHeader(*file_handle);
+			ZeekHeader file_header;
+			try {
+				auto file_handle = fs.OpenFile(result->file_paths[file_idx],
+				                               FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+				file_header = ZeekReader::ParseHeader(*file_handle);
+			} catch (const std::exception &e) {
+				if (!result->ignore_file_errors) {
+					throw;
+				}
+				// Skip this corrupted file - mark it as having no fields so OpenNextFile will also skip it
+				file_field_to_union[file_idx].clear();
+				continue;
+			}
 
 			if (first_file) {
 				// Use file 0's separators / null markers as the canonical settings.
@@ -515,6 +563,15 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 					}
 					file_field_to_union[file_idx][f] = existing;
 				}
+			}
+		}
+
+		// Check if at least one file was successfully processed
+		if (result->header.fields.empty()) {
+			if (result->ignore_file_errors) {
+				throw IOException("No valid Zeek log files found in pattern: %s (all files failed to parse)", pattern);
+			} else {
+				throw IOException("No valid Zeek log files found in pattern: %s", pattern);
 			}
 		}
 
@@ -858,6 +915,7 @@ TableFunction GetZeekScanFunction() {
 	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
 	func.named_parameters["inet"] = LogicalType::BOOLEAN;
 	func.named_parameters["union_by_name"] = LogicalType::BOOLEAN;
+	func.named_parameters["ignore_file_errors"] = LogicalType::BOOLEAN;
 	func.projection_pushdown = true;
 	func.filter_pushdown = true;
 	func.supports_pushdown_type = ZeekSupportsPushdownType;

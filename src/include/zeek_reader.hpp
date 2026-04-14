@@ -80,6 +80,9 @@ struct ZeekScanBindData : public TableFunctionData {
 	//! files' fields and missing fields become NULL. When false (default) all files must have
 	//! identical schemas — any mismatch is an error.
 	bool union_by_name = false;
+	//! Whether to ignore corrupted or unreadable files instead of throwing an error.
+	//! When true, files that cannot be opened or parsed are silently skipped.
+	bool ignore_file_errors = false;
 	//! When union_by_name=true: per-file inverse mapping. union_to_file_field[file_idx][union_col]
 	//! gives the field index within that file for the given union column, or idx_t(-1) if the
 	//! field is absent from this file. Empty when union_by_name=false.
