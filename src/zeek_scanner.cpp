@@ -280,10 +280,12 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 			}
 
 			if (file_header.fields.empty()) {
-				throw InvalidInputException("read_zeek: file '%s' is missing #fields directive", lstate.current_file_path);
+				throw InvalidInputException("read_zeek: file '%s' is missing #fields directive",
+				                            lstate.current_file_path);
 			}
 			if (file_header.types.empty()) {
-				throw InvalidInputException("read_zeek: file '%s' is missing #types directive", lstate.current_file_path);
+				throw InvalidInputException("read_zeek: file '%s' is missing #types directive",
+				                            lstate.current_file_path);
 			}
 			if (file_header.fields.size() != file_header.types.size()) {
 				throw InvalidInputException("read_zeek: file '%s' has mismatched #fields and #types counts",
