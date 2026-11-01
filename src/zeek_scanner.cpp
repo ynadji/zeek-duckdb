@@ -10,6 +10,9 @@
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 
 #include <cstring>
 #include <unordered_map>
@@ -203,6 +206,177 @@ static Value SliceToValue(ClientContext &context, const FieldSlice &field, const
 	}
 }
 
+template <class T>
+static void NormalizeValueRange(ZeekValueRange<T> &range) {
+	if (!range.lower || !range.upper) {
+		return;
+	}
+	if (*range.lower > *range.upper ||
+	    (*range.lower == *range.upper && (!range.lower_inclusive || !range.upper_inclusive))) {
+		range.empty = true;
+	}
+}
+
+template <class T>
+static void AddValueLowerBound(ZeekValueRange<T> &range, T value, bool inclusive) {
+	if (!range.lower || value > *range.lower) {
+		range.lower = value;
+		range.lower_inclusive = inclusive;
+	} else if (value == *range.lower) {
+		range.lower_inclusive = range.lower_inclusive && inclusive;
+	}
+	NormalizeValueRange(range);
+}
+
+template <class T>
+static void AddValueUpperBound(ZeekValueRange<T> &range, T value, bool inclusive) {
+	if (!range.upper || value < *range.upper) {
+		range.upper = value;
+		range.upper_inclusive = inclusive;
+	} else if (value == *range.upper) {
+		range.upper_inclusive = range.upper_inclusive && inclusive;
+	}
+	NormalizeValueRange(range);
+}
+
+template <class T>
+static void IntersectValueRanges(ZeekValueRange<T> &range, const ZeekValueRange<T> &other) {
+	if (other.lower) {
+		AddValueLowerBound(range, *other.lower, other.lower_inclusive);
+	}
+	if (other.upper) {
+		AddValueUpperBound(range, *other.upper, other.upper_inclusive);
+	}
+	range.empty = range.empty || other.empty;
+	NormalizeValueRange(range);
+}
+
+template <class T>
+static bool TryGetTemporalConstant(const Expression &expression, LogicalTypeId type, T &result) {
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	const auto &value = expression.Cast<BoundConstantExpression>().GetValue();
+	if (value.IsNull() || value.type().id() != type) {
+		return false;
+	}
+	result = value.GetValue<T>();
+	return true;
+}
+
+//! Extract only direct temporal bounds. Unsupported expressions remain evaluated by the scan.
+template <class T>
+static bool ExtractZeekValueRange(const Expression &expression, ZeekValueRange<T> &range, LogicalTypeId type) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+	    expression.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+		bool found_constraint = false;
+		for (auto &child : conjunction.GetChildren()) {
+			ZeekValueRange<T> child_range;
+			if (!ExtractZeekValueRange(*child, child_range, type)) {
+				continue;
+			}
+			IntersectValueRanges(range, child_range);
+			found_constraint = true;
+		}
+		return found_constraint;
+	}
+
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<BoundFunctionExpression>();
+	if (expression.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+		if (!BoundBetweenExpression::HasValidBindData(function) ||
+		    !ExpressionFilter::IsSimpleFilterColumnRef(BoundBetweenExpression::Input(function))) {
+			return false;
+		}
+		T lower;
+		T upper;
+		if (!TryGetTemporalConstant(BoundBetweenExpression::LowerBound(function), type, lower) ||
+		    !TryGetTemporalConstant(BoundBetweenExpression::UpperBound(function), type, upper)) {
+			return false;
+		}
+		AddValueLowerBound(range, lower, BoundBetweenExpression::LowerInclusive(function));
+		AddValueUpperBound(range, upper, BoundBetweenExpression::UpperInclusive(function));
+		return true;
+	}
+
+	if (!BoundComparisonExpression::IsComparison(expression)) {
+		return false;
+	}
+	ExpressionType comparison_type;
+	auto constant = ExpressionFilter::TryGetColumnConstantComparison(function, comparison_type);
+	if (!constant) {
+		return false;
+	}
+	T value;
+	if (!TryGetTemporalConstant(*constant, type, value)) {
+		return false;
+	}
+
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		AddValueLowerBound(range, value, true);
+		AddValueUpperBound(range, value, true);
+		return true;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		AddValueLowerBound(range, value, false);
+		return true;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		AddValueLowerBound(range, value, true);
+		return true;
+	case ExpressionType::COMPARE_LESSTHAN:
+		AddValueUpperBound(range, value, false);
+		return true;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		AddValueUpperBound(range, value, true);
+		return true;
+	default:
+		return false;
+	}
+}
+
+template <class T>
+static optional<ZeekValueRange<T>> ExtractZeekValueRange(const TableFilterSet &filters,
+                                                         const vector<column_t> &scan_schema_cols, column_t column_idx,
+                                                         LogicalTypeId type) {
+	ZeekValueRange<T> range;
+	bool found_constraint = false;
+	for (const auto &entry : filters) {
+		idx_t scan_idx = entry.GetIndex().GetIndex();
+		if (scan_idx >= scan_schema_cols.size() || scan_schema_cols[scan_idx] != column_idx ||
+		    entry.Filter().filter_type != TableFilterType::EXPRESSION_FILTER) {
+			continue;
+		}
+		ZeekValueRange<T> filter_range;
+		auto &expr_filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "read_zeek");
+		if (!ExtractZeekValueRange(*expr_filter.expr, filter_range, type)) {
+			continue;
+		}
+		IntersectValueRanges(range, filter_range);
+		found_constraint = true;
+	}
+	if (!found_constraint) {
+		return {};
+	}
+	return range;
+}
+
+template <class T>
+static bool ValueMatchesRange(T value, const ZeekValueRange<T> &range) {
+	if (range.empty) {
+		return false;
+	}
+	if (range.lower && (value < *range.lower || (value == *range.lower && !range.lower_inclusive))) {
+		return false;
+	}
+	if (range.upper && (value > *range.upper || (value == *range.upper && !range.upper_inclusive))) {
+		return false;
+	}
+	return true;
+}
+
 //! Atomically claim the next file from the shared queue and open it for the calling thread.
 //! Returns false if no more files remain.
 static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, ZeekScanLocalState &lstate,
@@ -210,10 +384,11 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 	auto &fs = FileSystem::GetFileSystem(context);
 
 	while (true) {
-		idx_t my_file_idx = gstate.next_file_idx.fetch_add(1, std::memory_order_relaxed);
-		if (my_file_idx >= bind_data.file_paths.size()) {
+		idx_t scan_file_idx = gstate.next_file_idx.fetch_add(1, std::memory_order_relaxed);
+		if (scan_file_idx >= gstate.scan_file_indices.size()) {
 			return false;
 		}
+		idx_t my_file_idx = gstate.scan_file_indices[scan_file_idx];
 
 		lstate.current_file_idx = my_file_idx;
 		lstate.current_file_path = bind_data.file_paths[my_file_idx];
@@ -418,6 +593,11 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		result->filename_column = filename_param->second.GetValue<bool>();
 	}
 
+	auto partition_discovery_param = input.named_parameters.find("partition_discovery");
+	if (partition_discovery_param != input.named_parameters.end()) {
+		result->partition_discovery = partition_discovery_param->second.GetValue<bool>();
+	}
+
 	bool replace_periods = true;
 	auto replace_periods_param = input.named_parameters.find("replace_periods");
 	if (replace_periods_param != input.named_parameters.end()) {
@@ -437,6 +617,17 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 	auto ignore_file_errors_param = input.named_parameters.find("ignore_file_errors");
 	if (ignore_file_errors_param != input.named_parameters.end()) {
 		result->ignore_file_errors = ignore_file_errors_param->second.GetValue<bool>();
+	}
+
+	if (result->partition_discovery) {
+		result->file_dates.reserve(result->file_paths.size());
+		result->file_time_ranges.reserve(result->file_paths.size());
+		for (auto &file_path : result->file_paths) {
+			auto file_date = TryExtractZeekLogDate(file_path);
+			result->file_dates.push_back(file_date);
+			result->file_time_ranges.push_back(file_date ? TryExtractZeekLogTimeRange(file_path, *file_date)
+			                                             : optional<ZeekFileTimeRange>());
+		}
 	}
 
 	if (!result->union_by_name) {
@@ -555,13 +746,35 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		if (replace_periods) {
 			std::replace(col_name.begin(), col_name.end(), '.', '_');
 		}
+		if (result->partition_discovery &&
+		    (StringUtil::CIEquals(col_name, "log_date") || StringUtil::CIEquals(col_name, "log_start_time") ||
+		     StringUtil::CIEquals(col_name, "log_end_time"))) {
+			throw BinderException("read_zeek: partition_discovery adds virtual date/time columns, but a log file "
+			                      "already contains the name '%s'",
+			                      col_name);
+		}
 		names.push_back(Identifier(col_name));
 		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i], result->use_inet, &context);
 		return_types.push_back(col_type);
 		result->column_types.push_back(col_type);
 	}
 
+	if (result->partition_discovery) {
+		result->log_date_column_idx = static_cast<column_t>(return_types.size());
+		names.push_back(Identifier("log_date"));
+		return_types.push_back(LogicalType::DATE);
+
+		result->log_start_time_column_idx = static_cast<column_t>(return_types.size());
+		names.push_back(Identifier("log_start_time"));
+		return_types.push_back(LogicalType::TIMESTAMP);
+
+		result->log_end_time_column_idx = static_cast<column_t>(return_types.size());
+		names.push_back(Identifier("log_end_time"));
+		return_types.push_back(LogicalType::TIMESTAMP);
+	}
+
 	if (result->filename_column) {
+		result->filename_column_idx = static_cast<column_t>(return_types.size());
 		names.push_back("filename");
 		return_types.push_back(LogicalType::VARCHAR);
 	}
@@ -572,8 +785,6 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ZeekScanBindData>();
 	auto result = make_uniq<ZeekScanGlobalState>();
-
-	result->total_files = bind_data.file_paths.size();
 
 	// Resolve projection: which schema columns does the query actually want?
 	// column_ids is provided by DuckDB when projection_pushdown = true.
@@ -601,7 +812,7 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 	result->needs_cast_buffer.resize(result->projected_schema_cols.size(), false);
 	for (idx_t out_idx = 0; out_idx < result->projected_schema_cols.size(); out_idx++) {
 		column_t schema_col = result->projected_schema_cols[out_idx];
-		if (bind_data.filename_column && schema_col == data_col_count) {
+		if (bind_data.filename_column_idx && schema_col == *bind_data.filename_column_idx) {
 			continue;
 		}
 		if (schema_col >= data_col_count) {
@@ -617,6 +828,38 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 
 	// Capture any pushed-down filters for per-row evaluation.
 	result->filters = input.filters;
+
+	if (bind_data.partition_discovery && input.filters) {
+		if (bind_data.log_date_column_idx) {
+			result->date_range = ExtractZeekValueRange<date_t>(*input.filters, result->scan_schema_cols,
+			                                                   *bind_data.log_date_column_idx, LogicalTypeId::DATE);
+		}
+		if (bind_data.log_start_time_column_idx) {
+			result->start_time_range =
+			    ExtractZeekValueRange<timestamp_t>(*input.filters, result->scan_schema_cols,
+			                                       *bind_data.log_start_time_column_idx, LogicalTypeId::TIMESTAMP);
+		}
+		if (bind_data.log_end_time_column_idx) {
+			result->end_time_range = ExtractZeekValueRange<timestamp_t>(
+			    *input.filters, result->scan_schema_cols, *bind_data.log_end_time_column_idx, LogicalTypeId::TIMESTAMP);
+		}
+	}
+	result->scan_file_indices.reserve(bind_data.file_paths.size());
+	for (idx_t file_idx = 0; file_idx < bind_data.file_paths.size(); file_idx++) {
+		if (result->date_range && file_idx < bind_data.file_dates.size() && bind_data.file_dates[file_idx] &&
+		    !ValueMatchesRange(*bind_data.file_dates[file_idx], *result->date_range)) {
+			continue;
+		}
+		if (file_idx < bind_data.file_time_ranges.size() && bind_data.file_time_ranges[file_idx]) {
+			const auto &time_range = *bind_data.file_time_ranges[file_idx];
+			if ((result->start_time_range && !ValueMatchesRange(time_range.start, *result->start_time_range)) ||
+			    (result->end_time_range && !ValueMatchesRange(time_range.end, *result->end_time_range))) {
+				continue;
+			}
+		}
+		result->scan_file_indices.push_back(file_idx);
+	}
+	result->total_files = result->scan_file_indices.size();
 
 	return std::move(result);
 }
@@ -661,8 +904,6 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 	}
 
 	idx_t row_count = 0;
-	const idx_t data_col_count = bind_data.column_types.size();
-	const idx_t filename_col_idx = data_col_count; // virtual column index for filename
 	const string &unset_field = bind_data.header.unset_field;
 	const string &empty_field = bind_data.header.empty_field;
 	const char field_separator = bind_data.header.separator;
@@ -709,8 +950,40 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				auto &expr_filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "read_zeek");
 				auto &executor = *lstate.filter_executors[scan_idx];
 
+				if (bind_data.log_date_column_idx && schema_col == *bind_data.log_date_column_idx) {
+					const auto &file_date = bind_data.file_dates[lstate.current_file_idx];
+					Value value = file_date ? Value::DATE(*file_date) : Value(LogicalType::DATE);
+					if (!expr_filter.EvaluateWithConstant(executor, value)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
+				if (bind_data.log_start_time_column_idx && schema_col == *bind_data.log_start_time_column_idx) {
+					const auto &file_time_range = bind_data.file_time_ranges[lstate.current_file_idx];
+					Value value =
+					    file_time_range ? Value::TIMESTAMP(file_time_range->start) : Value(LogicalType::TIMESTAMP);
+					if (!expr_filter.EvaluateWithConstant(executor, value)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
+				if (bind_data.log_end_time_column_idx && schema_col == *bind_data.log_end_time_column_idx) {
+					const auto &file_time_range = bind_data.file_time_ranges[lstate.current_file_idx];
+					Value value =
+					    file_time_range ? Value::TIMESTAMP(file_time_range->end) : Value(LogicalType::TIMESTAMP);
+					if (!expr_filter.EvaluateWithConstant(executor, value)) {
+						row_passes = false;
+						break;
+					}
+					continue;
+				}
+
 				// Filename virtual column filter (VARCHAR).
-				if (bind_data.filename_column && schema_col == filename_col_idx) {
+				if (bind_data.filename_column_idx && schema_col == *bind_data.filename_column_idx) {
 					Value v(lstate.current_file_path);
 					if (!expr_filter.EvaluateWithConstant(executor, v)) {
 						row_passes = false;
@@ -760,8 +1033,38 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			column_t schema_col = gstate.projected_schema_cols[out_idx];
 			auto &vec = output.data[out_idx];
 
+			if (bind_data.log_date_column_idx && schema_col == *bind_data.log_date_column_idx) {
+				const auto &file_date = bind_data.file_dates[lstate.current_file_idx];
+				if (file_date) {
+					FlatVector::GetDataMutable<date_t>(vec)[row_count] = *file_date;
+				} else {
+					FlatVector::SetNull(vec, row_count, true);
+				}
+				continue;
+			}
+
+			if (bind_data.log_start_time_column_idx && schema_col == *bind_data.log_start_time_column_idx) {
+				const auto &file_time_range = bind_data.file_time_ranges[lstate.current_file_idx];
+				if (file_time_range) {
+					FlatVector::GetDataMutable<timestamp_t>(vec)[row_count] = file_time_range->start;
+				} else {
+					FlatVector::SetNull(vec, row_count, true);
+				}
+				continue;
+			}
+
+			if (bind_data.log_end_time_column_idx && schema_col == *bind_data.log_end_time_column_idx) {
+				const auto &file_time_range = bind_data.file_time_ranges[lstate.current_file_idx];
+				if (file_time_range) {
+					FlatVector::GetDataMutable<timestamp_t>(vec)[row_count] = file_time_range->end;
+				} else {
+					FlatVector::SetNull(vec, row_count, true);
+				}
+				continue;
+			}
+
 			// Filename virtual column.
-			if (bind_data.filename_column && schema_col == filename_col_idx) {
+			if (bind_data.filename_column_idx && schema_col == *bind_data.filename_column_idx) {
 				FlatVector::GetDataMutable<string_t>(vec)[row_count] =
 				    StringVector::AddString(vec, lstate.current_file_path);
 				continue;
@@ -891,9 +1194,17 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 //! We return true only for types we can cheaply parse from a slice per-row.
 static bool ZeekSupportsPushdownType(const FunctionData &bind_data_p, idx_t col_idx) {
 	auto &bind_data = bind_data_p.Cast<ZeekScanBindData>();
-	// The filename virtual column is always VARCHAR; filters on it are cheap.
-	if (col_idx >= bind_data.column_types.size()) {
+	if ((bind_data.log_date_column_idx && col_idx == *bind_data.log_date_column_idx) ||
+	    (bind_data.log_start_time_column_idx && col_idx == *bind_data.log_start_time_column_idx) ||
+	    (bind_data.log_end_time_column_idx && col_idx == *bind_data.log_end_time_column_idx)) {
 		return true;
+	}
+	// The filename virtual column is always VARCHAR; filters on it are cheap.
+	if (bind_data.filename_column_idx && col_idx == *bind_data.filename_column_idx) {
+		return true;
+	}
+	if (col_idx >= bind_data.column_types.size()) {
+		return false;
 	}
 	return CanPushdownFilterOnType(bind_data.column_types[col_idx]);
 }
@@ -906,7 +1217,8 @@ TableFunction GetZeekScanFunction() {
 		    .Add("replace_periods", LogicalType::BOOLEAN)
 		    .Add("inet", LogicalType::BOOLEAN)
 		    .Add("union_by_name", LogicalType::BOOLEAN)
-		    .Add("ignore_file_errors", LogicalType::BOOLEAN);
+		    .Add("ignore_file_errors", LogicalType::BOOLEAN)
+		    .Add("partition_discovery", LogicalType::BOOLEAN);
 	});
 	func.projection_pushdown = true;
 	func.filter_pushdown = true;

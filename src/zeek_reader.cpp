@@ -1,8 +1,115 @@
 #include "zeek_reader.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/path.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 
 namespace duckdb {
+
+optional<date_t> TryExtractZeekLogDate(const string &path) {
+	Path parsed_path;
+	try {
+		parsed_path = Path::FromString(path);
+	} catch (const InvalidInputException &) {
+		return {};
+	}
+
+	const auto &segments = parsed_path.GetPathSegments();
+	if (parsed_path.HasTrailingSeparator() || segments.size() < 2) {
+		return {};
+	}
+	const auto &date_directory = segments[segments.size() - 2];
+	if (date_directory.size() != 10) {
+		return {};
+	}
+	const char *date_string = date_directory.data();
+	if (date_string[4] != '-' || date_string[7] != '-') {
+		return {};
+	}
+	for (idx_t i = 0; i < 10; i++) {
+		if (i == 4 || i == 7) {
+			continue;
+		}
+		if (date_string[i] < '0' || date_string[i] > '9') {
+			return {};
+		}
+	}
+
+	date_t result;
+	bool special = false;
+	idx_t position = 0;
+	if (Date::TryConvertDate(date_string, 10, position, result, special, true) != DateCastResult::SUCCESS ||
+	    position != 10 || special || !result.IsFinite()) {
+		return {};
+	}
+	return result;
+}
+
+optional<ZeekFileTimeRange> TryExtractZeekLogTimeRange(const string &path, date_t log_date) {
+	Path parsed_path;
+	try {
+		parsed_path = Path::FromString(path);
+	} catch (const InvalidInputException &) {
+		return {};
+	}
+
+	const auto &segments = parsed_path.GetPathSegments();
+	if (parsed_path.HasTrailingSeparator() || segments.size() < 2) {
+		return {};
+	}
+	string file_name = segments.back();
+	if (StringUtil::EndsWith(file_name, ".gz")) {
+		file_name.resize(file_name.size() - 3);
+	} else if (StringUtil::EndsWith(file_name, ".zst")) {
+		file_name.resize(file_name.size() - 4);
+	}
+	if (!StringUtil::EndsWith(file_name, ".log")) {
+		return {};
+	}
+	file_name.resize(file_name.size() - 4);
+
+	auto range_start = file_name.rfind('.');
+	if (range_start == string::npos) {
+		return {};
+	}
+	const string range = file_name.substr(range_start + 1);
+	if (range.size() != 17 || range[2] != ':' || range[5] != ':' || range[8] != '-' || range[11] != ':' ||
+	    range[14] != ':') {
+		return {};
+	}
+	for (idx_t i = 0; i < range.size(); i++) {
+		if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) {
+			continue;
+		}
+		if (range[i] < '0' || range[i] > '9') {
+			return {};
+		}
+	}
+
+	dtime_t start_time;
+	dtime_t end_time;
+	idx_t start_position = 0;
+	idx_t end_position = 0;
+	if (!Time::TryConvertTime(range.data(), 8, start_position, start_time, true) || start_position != 8 ||
+	    !Time::TryConvertTime(range.data() + 9, 8, end_position, end_time, true) || end_position != 8 ||
+	    start_time == end_time) {
+		return {};
+	}
+
+	date_t end_date = log_date;
+	if (end_time < start_time) {
+		end_date = end_date + 1;
+	}
+	timestamp_t start_timestamp;
+	timestamp_t end_timestamp;
+	if (!Timestamp::TryFromDatetime(log_date, start_time, start_timestamp) ||
+	    !Timestamp::TryFromDatetime(end_date, end_time, end_timestamp)) {
+		return {};
+	}
+	return ZeekFileTimeRange {start_timestamp, end_timestamp};
+}
 
 string ZeekReader::ParseSeparator(const string &sep_str) {
 	string result;

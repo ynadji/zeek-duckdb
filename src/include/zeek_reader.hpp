@@ -2,6 +2,9 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/optional.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -63,18 +66,41 @@ public:
 //! `path` and `open_time` fields are intentionally ignored.
 bool SameSchema(const ZeekHeader &expected, const ZeekHeader &actual, string &mismatch_reason);
 
+//! Extract a valid date from the input file's immediate parent directory.
+optional<date_t> TryExtractZeekLogDate(const string &path);
+
+//! File coverage interval encoded as local wall-clock timestamps in its filename.
+struct ZeekFileTimeRange {
+	timestamp_t start;
+	timestamp_t end;
+};
+
+//! Extract an explicit HH:MM:SS-HH:MM:SS range using the file's date directory.
+optional<ZeekFileTimeRange> TryExtractZeekLogTimeRange(const string &path, date_t log_date);
+
 //! Bind data for the read_zeek table function
 struct ZeekScanBindData : public TableFunctionData {
 	//! List of file paths (expanded from glob)
 	vector<string> file_paths;
+	//! Date inferred from the immediate parent directory of each file, when enabled.
+	vector<optional<date_t>> file_dates;
+	//! Time interval inferred from each filename when it contains an explicit time range.
+	vector<optional<ZeekFileTimeRange>> file_time_ranges;
 	//! Parsed header information. In strict mode this is file 0's header. In union mode the
 	//! `fields` and `types` vectors contain the union of all files' fields, in the order they
 	//! were first encountered (file 0's fields first, then any new fields from file 1, etc.).
 	ZeekHeader header;
 	//! DuckDB types for each column (size matches header.fields).
 	vector<LogicalType> column_types;
+	//! Virtual output column indexes. The Zeek data columns remain in column_types.
+	optional<column_t> log_date_column_idx;
+	optional<column_t> log_start_time_column_idx;
+	optional<column_t> log_end_time_column_idx;
+	optional<column_t> filename_column_idx;
 	//! Whether to add a filename column
 	bool filename_column = false;
+	//! Whether to discover YYYY-MM-DD parent directories as a virtual log_date column.
+	bool partition_discovery = false;
 	//! Whether to use INET type for addr/subnet (requires inet extension)
 	bool use_inet = true;
 	//! Whether to union schemas across files. When true, the output schema is the union of all
@@ -90,6 +116,18 @@ struct ZeekScanBindData : public TableFunctionData {
 	vector<vector<idx_t>> union_to_file_field;
 };
 
+//! Bounds extracted from filters on a temporal virtual column.
+template <class T>
+struct ZeekValueRange {
+	optional<T> lower;
+	optional<T> upper;
+	bool lower_inclusive = true;
+	bool upper_inclusive = true;
+	bool empty = false;
+};
+using ZeekDateRange = ZeekValueRange<date_t>;
+using ZeekTimestampRange = ZeekValueRange<timestamp_t>;
+
 //! A view into a contiguous span of bytes (no ownership)
 struct FieldSlice {
 	const char *ptr;
@@ -99,13 +137,19 @@ struct FieldSlice {
 //! Global state for the read_zeek table function. Shared across all parallel scanner threads —
 //! contains only read-only or atomic data.
 struct ZeekScanGlobalState : public GlobalTableFunctionState {
-	//! Atomic counter for the next file index to claim from bind_data.file_paths.
+	//! Atomic counter for the next retained file index to claim.
 	std::atomic<idx_t> next_file_idx {0};
-	//! Total number of files (cached from bind_data, used for MaxThreads).
+	//! Original file indexes retained after safe date partition pruning.
+	vector<idx_t> scan_file_indices;
+	//! Normalized range used to prune files, when one was safely extracted.
+	optional<ZeekDateRange> date_range;
+	optional<ZeekTimestampRange> start_time_range;
+	optional<ZeekTimestampRange> end_time_range;
+	//! Total number of retained files (used for MaxThreads).
 	idx_t total_files = 0;
 
 	//! Projection pushdown: for each output column index, the schema column index it maps to.
-	//! A value of data_col_count means the filename virtual column.
+	//! Virtual column indexes are stored separately in ZeekScanBindData.
 	vector<column_t> projected_schema_cols;
 	//! True if no columns are projected (e.g. COUNT(*)) — skip all parsing
 	bool count_only = false;
