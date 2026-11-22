@@ -1,0 +1,9 @@
+#separator \x09
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#fields	id	u	incomplete	childless	nested	opaque_list
+#types	count	opaque_kind	vector[	vector[]	vector[vector[string]]	vector[opaque_kind]
+1	(empty)	(empty)	(empty)	(empty)	(empty)
+2	007	x,(empty),-	x,(empty),-	[x],(empty),-	x,(empty),-
+3	-	-	-	-	-

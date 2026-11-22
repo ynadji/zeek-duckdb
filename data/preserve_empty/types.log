@@ -1,0 +1,10 @@
+#separator \x09
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#fields	id	s	e	a	net	ve	va	vnet
+#types	count	string	enum	addr	subnet	vector[enum]	vector[addr]	vector[subnet]
+1	-	-	-	-	-	-	-
+2	(empty)	(empty)	(empty)	(empty)	(empty)	(empty)	(empty)
+3	ok	Mode::NORMAL	192.0.2.1	192.0.2.0/24	Mode::NORMAL,(empty),-,Mode::OTHER	192.0.2.1,(empty),-,2001:db8::1	192.0.2.0/24,(empty),-,2001:db8::/32
+3	ok	Mode::NORMAL	192.0.2.1	192.0.2.0/24	Mode::NORMAL,(empty),-,Mode::OTHER	192.0.2.1,(empty),-,2001:db8::1	192.0.2.0/24,(empty),-,2001:db8::/32

@@ -1,0 +1,9 @@
+#separator \x09
+#set_separator	,
+#empty_field	(empty)
+#unset_field	-
+#fields	id	a	net	av
+#types	count	addr	subnet	vector[addr]
+1	192.0.2.1	192.0.2.0/24	192.0.2.1,2001:db8::1
+2	(empty)	(empty)	(empty)
+3	-	-	-,(empty),192.0.2.2

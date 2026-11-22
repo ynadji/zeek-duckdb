@@ -77,6 +77,8 @@ struct ZeekScanBindData : public TableFunctionData {
 	bool filename_column = false;
 	//! Whether to use INET type for addr/subnet (requires inet extension)
 	bool use_inet = true;
+	//! Preserve Zeek empty strings and containers instead of converting them to NULL.
+	bool preserve_empty = false;
 	//! Whether to union schemas across files. When true, the output schema is the union of all
 	//! files' fields and missing fields become NULL. When false (default) all files must have
 	//! identical schemas — any mismatch is an error.

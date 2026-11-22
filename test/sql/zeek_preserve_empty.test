@@ -1,0 +1,217 @@
+# name: test/sql/zeek_preserve_empty.test
+# description: Opt-in empty preservation and legacy defaults
+# group: [sql]
+
+require zeek
+
+foreach variant default custom
+
+foreach mode false true
+
+statement ok
+CREATE OR REPLACE TEMP VIEW pe AS SELECT * FROM read_zeek('data/preserve_empty/{variant}.log', inet=false, preserve_empty={mode});
+
+query I
+SELECT s IS NULL AND ss IS NULL AND vs IS NULL AND ns IS NULL AND bs IS NULL AND n=0 AND b=false FROM pe WHERE id=1;
+----
+true
+
+query I
+SELECT CASE WHEN {mode} THEN s='' AND ss=[]::VARCHAR[] AND vs=[]::VARCHAR[] AND ns=[]::UBIGINT[] AND bs=[]::BOOLEAN[] ELSE s IS NULL AND ss IS NULL AND vs IS NULL AND ns IS NULL AND bs IS NULL END AND a IS NULL AND e IS NULL FROM pe WHERE id=2;
+----
+true
+
+query I
+SELECT s='alpha' AND ss=['a','b'] AND vs=['b','a'] AND ns=[0,1] AND bs=[false,true] AND n=42 AND b=true FROM pe WHERE id=3;
+----
+true
+
+query I
+SELECT ss IS NOT DISTINCT FROM CASE WHEN {mode} THEN [NULL,'','x']::VARCHAR[] ELSE [NULL,NULL,'x']::VARCHAR[] END AND vs IS NOT DISTINCT FROM CASE WHEN {mode} THEN ['x','',NULL]::VARCHAR[] ELSE ['x',NULL,NULL]::VARCHAR[] END AND ns IS NOT DISTINCT FROM [NULL,NULL,0]::UBIGINT[] AND bs IS NOT DISTINCT FROM [NULL,NULL,false]::BOOLEAN[] FROM pe WHERE id=4;
+----
+true
+
+query I
+SELECT s='0' AND n=0 AND b=false FROM pe WHERE id=5;
+----
+true
+
+query I
+SELECT s='false' AND n=9 AND b=true FROM pe WHERE id=6;
+----
+true
+
+query I
+SELECT count(*)=6 FROM pe;
+----
+true
+
+statement ok
+CREATE OR REPLACE TEMP TABLE pe_materialized AS SELECT * FROM pe;
+
+foreach optimizer '' filter_pushdown
+
+statement ok
+SET disabled_optimizers={optimizer};
+
+# Compare the scan against filters applied to already materialized values.
+foreach column s ss vs a e
+
+query II
+SELECT (SELECT list(id ORDER BY id) FROM pe WHERE {column} IS NULL) IS NOT DISTINCT FROM
+       (SELECT list(id ORDER BY id) FROM pe_materialized WHERE {column} IS NULL),
+       (SELECT list(id ORDER BY id) FROM pe WHERE {column} IS NOT NULL) IS NOT DISTINCT FROM
+       (SELECT list(id ORDER BY id) FROM pe_materialized WHERE {column} IS NOT NULL);
+----
+true	true
+
+endloop
+
+foreach predicate s='' s<>'' vs=[] len(vs)=0 ss=[] n=0 b=false
+
+query I
+WITH scanned AS (SELECT * FROM pe WHERE {predicate}),
+     materialized AS (SELECT * FROM pe_materialized WHERE {predicate})
+SELECT count(*) FROM ((FROM scanned EXCEPT ALL FROM materialized) UNION ALL (FROM materialized EXCEPT ALL FROM scanned));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+RESET disabled_optimizers;
+
+endloop
+
+statement ok
+CREATE OR REPLACE TEMP TABLE pe_omitted AS SELECT * FROM read_zeek('data/preserve_empty/{variant}.log', inet=false);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE pe_false AS SELECT * FROM read_zeek('data/preserve_empty/{variant}.log', inet=false, preserve_empty=false);
+
+query I
+SELECT NOT EXISTS ((TABLE pe_omitted EXCEPT ALL TABLE pe_false) UNION ALL (TABLE pe_false EXCEPT ALL TABLE pe_omitted));
+----
+true
+
+endloop
+
+foreach mode false true
+
+statement ok
+CREATE OR REPLACE TEMP TABLE pe_union AS SELECT * FROM read_zeek('data/preserve_empty/union_*.log', inet=false, union_by_name=true, preserve_empty={mode});
+
+query I
+SELECT count(*)=4 FROM pe_union;
+----
+true
+
+query I
+SELECT bool_and(s IS NULL AND vs IS NULL AND extra IS NULL) FILTER (WHERE id=2) FROM pe_union;
+----
+true
+
+query I
+SELECT bool_and(s IS NULL) FILTER (WHERE id=3) FROM pe_union;
+----
+true
+
+query I
+SELECT bool_and(CASE WHEN {mode} THEN s='' AND vs=[]::VARCHAR[] AND extra IS NULL ELSE s IS NULL AND vs IS NULL AND extra IS NULL END) FILTER (WHERE id=1) FROM pe_union;
+----
+true
+
+query I
+SELECT bool_and(CASE WHEN {mode} THEN vs=[]::VARCHAR[] AND extra='' ELSE vs IS NULL AND extra IS NULL END) FILTER (WHERE id=3) FROM pe_union;
+----
+true
+
+endloop
+
+# Values resembling the default markers are ordinary data with custom markers.
+query III
+SELECT s, vs[1], vs[2]
+FROM read_zeek('data/preserve_empty/literals.log', inet=false, preserve_empty=true)
+ORDER BY s;
+----
+(empty)	-	(empty)
+-	-	(empty)
+
+# ENUM and IP types can map to VARCHAR. Their markers remain NULL.
+statement ok
+CREATE TEMP VIEW typed AS
+SELECT * FROM read_zeek('data/preserve_empty/types.log', inet=false, preserve_empty=true);
+
+query IIIIIII
+SELECT s = '', e IS NULL, a IS NULL, net IS NULL, len(ve), len(va), len(vnet)
+FROM typed WHERE id=2;
+----
+true	true	true	true	0	0	0
+
+query I
+SELECT count(*) FROM typed WHERE id=3
+  AND e='Mode::NORMAL' AND a='192.0.2.1' AND net='192.0.2.0/24'
+  AND ve IS NOT DISTINCT FROM ['Mode::NORMAL',NULL,NULL,'Mode::OTHER']
+  AND va IS NOT DISTINCT FROM ['192.0.2.1',NULL,NULL,'2001:db8::1']
+  AND vnet IS NOT DISTINCT FROM ['192.0.2.0/24',NULL,NULL,'2001:db8::/32'];
+----
+2
+
+# Fallback VARCHAR mappings do not imply a declared Zeek string.
+foreach mode false true
+
+statement ok
+CREATE OR REPLACE TEMP VIEW fallbacks AS
+SELECT * FROM read_zeek('data/preserve_empty/type_fallbacks.log', inet=false, preserve_empty={mode});
+
+query I
+SELECT u IS NULL AND incomplete IS NULL AND childless IS NULL
+  AND CASE WHEN {mode} THEN len(nested)=0 AND len(opaque_list)=0
+           ELSE nested IS NULL AND opaque_list IS NULL END
+FROM fallbacks WHERE id=1;
+----
+true
+
+query IIIII
+SELECT u, incomplete, childless, nested, opaque_list FROM fallbacks WHERE id=2;
+----
+007	[x, NULL, NULL]	[x, NULL, NULL]	[[x], NULL, NULL]	[x, NULL, NULL]
+
+query I
+SELECT u IS NULL AND incomplete IS NULL AND childless IS NULL AND nested IS NULL AND opaque_list IS NULL
+FROM fallbacks WHERE id=3;
+----
+true
+
+endloop
+
+# Repeat unset, empty, and ordinary values across multiple DuckDB chunks.
+statement ok
+COPY (
+  SELECT line FROM (
+    VALUES (-6, '#separator ' || chr(92) || 'x09'),
+           (-5, '#set_separator' || chr(9) || ','),
+           (-4, '#empty_field' || chr(9) || '(empty)'),
+           (-3, '#unset_field' || chr(9) || '-'),
+           (-2, '#fields' || chr(9) || 'id' || chr(9) || 's' || chr(9) || 'vs'),
+           (-1, '#types' || chr(9) || 'count' || chr(9) || 'string' || chr(9) || 'vector[string]')
+    UNION ALL
+    SELECT i, concat_ws(chr(9), i, marker, marker)
+    FROM (SELECT i, CASE i % 3 WHEN 0 THEN '-' WHEN 1 THEN '(empty)' ELSE 'x' END AS marker
+          FROM range(5000) AS ids(i))
+  ) AS rows(sort_key, line) ORDER BY sort_key
+) TO '{TEST_DIR}/preserve_empty_chunks.log' (FORMAT CSV, HEADER false, DELIMITER '|', QUOTE '', ESCAPE '');
+
+foreach mode false true
+
+query II
+SELECT count(*), count(*) FILTER (WHERE
+  s IS NOT DISTINCT FROM CASE id % 3 WHEN 1 THEN CASE WHEN {mode} THEN '' END WHEN 2 THEN 'x' END
+  AND vs IS NOT DISTINCT FROM CASE id % 3 WHEN 1 THEN CASE WHEN {mode} THEN []::VARCHAR[] END WHEN 2 THEN ['x'] END)
+FROM read_zeek('{TEST_DIR}/preserve_empty_chunks.log', inet=false, preserve_empty={mode});
+----
+5000	5000
+
+endloop
