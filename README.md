@@ -71,6 +71,7 @@ The `read_zeek` table function takes a file path or glob pattern as its first ar
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `preserve_empty` | `BOOLEAN` | `false` | Preserve Zeek empty strings and set/vector values instead of converting them to `NULL`. Unset values remain `NULL`. |
 | `inet` | `BOOLEAN` | `true` | Map Zeek `addr` and `subnet` to DuckDB `INET`. Requires the `inet` extension (`INSTALL inet; LOAD inet;`). Set to `false` to read these columns as `VARCHAR` instead. |
 | `filename` | `BOOLEAN` | `false` | Add a `filename` column to the output that holds the path of the source file each row came from. Mostly useful when reading globs. |
 | `replace_periods` | `BOOLEAN` | `true` | Replace `.` with `_` in column names so they can be referenced unquoted in SQL. For example, `id.orig_h` becomes `id_orig_h`. Set to `false` to keep the original names — you'll then need to quote them, e.g. `"id.orig_h"`. |
@@ -100,6 +101,36 @@ SELECT host_ip FROM read_zeek('known_hosts.log.gz', inet=false);
 -- Skip corrupted files instead of failing the query
 SELECT COUNT(*) FROM read_zeek('logs/*/notice*', union_by_name=true, ignore_file_errors=true);
 ```
+
+### Preserving empty values
+
+Zeek TSV declares each column's original type in the `#types` header. The
+extension uses that declaration to interpret the empty marker because an empty
+string and an empty collection carry different meanings. DuckDB type mappings
+stay the same, including the mapping of Zeek enum labels to VARCHAR.
+
+| TSV value | Omitted or `preserve_empty=false` | `preserve_empty=true` |
+|---|---|---|
+| `#unset_field` marker, any type | `NULL` | `NULL` |
+| `#empty_field` marker, Zeek `string` | `NULL` | `''` |
+| `#empty_field` marker, Zeek `set[T]` or `vector[T]` | `NULL` | `[]` |
+| `#empty_field` marker, other scalar types | `NULL` | `NULL` |
+
+Both modes use the marker strings from the file header, including custom
+markers. Ordinary values such as numeric zero and boolean false keep their
+usual conversions. In string sets and vectors with multiple elements, the
+option also preserves empty string elements. Unset elements become `NULL`.
+This option leaves the reader's type mapping and header validation in place.
+
+```sql
+SELECT uid, service
+FROM read_zeek('conn.log', inet=false, preserve_empty=true)
+WHERE service = '';
+```
+
+Zeek TSV can encode an empty collection and a collection containing one empty
+string with the same whole-field marker. The reader interprets that marker as
+an empty list when `preserve_empty=true`.
 
 ## Building
 

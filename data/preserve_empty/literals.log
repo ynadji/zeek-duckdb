@@ -1,0 +1,9 @@
+#separator \x09
+#set_separator	,
+#empty_field	EMPTY
+#unset_field	MISSING
+#path	unset_empty
+#fields	s	vs
+#types	string	vector[string]
+-	-,(empty)
+(empty)	-,(empty)

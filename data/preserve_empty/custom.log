@@ -1,0 +1,12 @@
+#separator \x09
+#set_separator	,
+#empty_field	EMPTY
+#unset_field	UNSET
+#fields	id	s	ss	vs	ns	bs	n	b	a	e
+#types	count	string	set[string]	vector[string]	vector[count]	vector[bool]	count	bool	addr	enum
+1	UNSET	UNSET	UNSET	UNSET	UNSET	0	F	192.0.2.1	ok
+2	EMPTY	EMPTY	EMPTY	EMPTY	EMPTY	0	F	EMPTY	EMPTY
+3	alpha	a,b	b,a	0,1	F,T	42	T	192.0.2.2	normal
+4	beta	UNSET,EMPTY,x	x,EMPTY,UNSET	UNSET,EMPTY,0	UNSET,EMPTY,F	7	F	UNSET	UNSET
+5	0	x	x	0	F	0	F	2001:db8::1	ok
+6	false	y	y	2	T	9	T	192.0.2.6	ok

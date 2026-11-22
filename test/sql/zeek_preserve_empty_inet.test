@@ -1,0 +1,39 @@
+# name: test/sql/zeek_preserve_empty_inet.test
+# description: Empty preservation with INET scalar and list casts
+# group: [sql]
+
+require zeek
+
+statement ok
+INSTALL inet;
+LOAD inet;
+
+foreach mode false true
+
+foreach inet_mode false true
+
+query I
+SELECT a IS NULL AND net IS NULL AND (CASE WHEN {mode} THEN len(av)=0 ELSE av IS NULL END) FROM read_zeek('data/preserve_empty/inet.log', inet={inet_mode}, preserve_empty={mode}) WHERE id=2;
+----
+true
+
+query I
+SELECT a IS NULL AND net IS NULL
+FROM read_zeek('data/preserve_empty/inet.log', inet={inet_mode}, preserve_empty={mode})
+WHERE id=3;
+----
+true
+
+query I
+SELECT av[1] IS NULL AND av[2] IS NULL AND av[3]::VARCHAR='192.0.2.2' FROM read_zeek('data/preserve_empty/inet.log', inet={inet_mode}, preserve_empty={mode}) WHERE id=3;
+----
+true
+
+query I
+SELECT a::VARCHAR='192.0.2.1' AND net::VARCHAR='192.0.2.0/24' AND len(av)=2 FROM read_zeek('data/preserve_empty/inet.log', inet={inet_mode}, preserve_empty={mode}) WHERE a='192.0.2.1';
+----
+true
+
+endloop
+
+endloop

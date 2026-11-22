@@ -1,0 +1,7 @@
+#separator \x09
+#empty_field	(empty)
+#unset_field	-
+#fields	id	s	vs
+#types	count	string	vector[string]
+1	(empty)	(empty)
+2	-	-

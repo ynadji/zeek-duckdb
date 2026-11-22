@@ -91,6 +91,22 @@ static inline bool SliceEquals(const FieldSlice &s, const string &str) {
 	return s.len == str.size() && std::memcmp(s.ptr, str.data(), s.len) == 0;
 }
 
+//! The original Zeek type determines which empty markers can be preserved.
+static bool HasEmptyValue(const string &zeek_type) {
+	if (zeek_type == "string") {
+		return true;
+	}
+	const auto opening = zeek_type.find('[');
+	return opening != string::npos && opening + 2 < zeek_type.size() && zeek_type.back() == ']' &&
+	       (StringUtil::StartsWith(zeek_type, "set[") || StringUtil::StartsWith(zeek_type, "vector["));
+}
+
+static bool MarkerIsNull(const FieldSlice &field, const string &zeek_type, const string &unset_field,
+                         const string &empty_field, bool preserve_empty) {
+	return SliceEquals(field, unset_field) ||
+	       (SliceEquals(field, empty_field) && (!preserve_empty || !HasEmptyValue(zeek_type)));
+}
+
 //! Returns true if the given type is handled directly in the per-row switch (no batch cast needed).
 static bool IsNativelyHandled(const LogicalType &type) {
 	switch (type.id()) {
@@ -292,7 +308,7 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 
 static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, Vector &vec, idx_t row_idx,
                             const FieldSlice &field, char set_separator, const LogicalType &child_type,
-                            const string &unset_field, const string &empty_field) {
+                            const string &unset_field, const string &empty_field, bool preserve_empty_strings) {
 	auto &list_entry = FlatVector::GetDataMutable<list_entry_t>(vec)[row_idx];
 	auto current_size = ListVector::GetListSize(vec);
 
@@ -317,7 +333,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		idx_t child_idx = current_size + i;
 		const FieldSlice &elem = elements[i];
 
-		if (SliceEquals(elem, unset_field) || SliceEquals(elem, empty_field)) {
+		if (SliceEquals(elem, unset_field) || (!preserve_empty_strings && SliceEquals(elem, empty_field))) {
 			FlatVector::SetNull(child_vec, child_idx, true);
 			continue;
 		}
@@ -385,8 +401,8 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
-			FlatVector::GetDataMutable<string_t>(child_vec)[child_idx] =
-			    StringVector::AddString(child_vec, elem.ptr, elem.len);
+			FlatVector::GetDataMutable<string_t>(child_vec)[child_idx] = StringVector::AddString(
+			    child_vec, elem.ptr, preserve_empty_strings && SliceEquals(elem, empty_field) ? 0 : elem.len);
 			break;
 		}
 		default: {
@@ -422,6 +438,11 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 	auto replace_periods_param = input.named_parameters.find("replace_periods");
 	if (replace_periods_param != input.named_parameters.end()) {
 		replace_periods = replace_periods_param->second.GetValue<bool>();
+	}
+
+	auto preserve_empty_param = input.named_parameters.find("preserve_empty");
+	if (preserve_empty_param != input.named_parameters.end()) {
+		result->preserve_empty = preserve_empty_param->second.GetValue<bool>();
 	}
 
 	auto inet_param = input.named_parameters.find("inet");
@@ -733,8 +754,9 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 				const FieldSlice &field = lstate.field_slices[file_field_idx];
 
-				// Unset/empty marker → treat as NULL.
-				if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
+				// Apply the same marker semantics as the output path.
+				if (MarkerIsNull(field, bind_data.header.types[schema_col], unset_field, empty_field,
+				                 bind_data.preserve_empty)) {
 					Value null_val(bind_data.column_types[schema_col]);
 					if (!expr_filter.EvaluateWithConstant(executor, null_val)) {
 						row_passes = false;
@@ -744,7 +766,9 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				}
 
 				// Parse the slice into a Value of the column's type and evaluate.
-				Value row_val = SliceToValue(context, field, bind_data.column_types[schema_col]);
+				Value row_val = bind_data.preserve_empty && SliceEquals(field, empty_field)
+				                    ? Value("")
+				                    : SliceToValue(context, field, bind_data.column_types[schema_col]);
 				if (!expr_filter.EvaluateWithConstant(executor, row_val)) {
 					row_passes = false;
 					break;
@@ -781,7 +805,8 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			const FieldSlice &field = lstate.field_slices[file_field_idx];
 
-			if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
+			if (MarkerIsNull(field, bind_data.header.types[schema_col], unset_field, empty_field,
+			                 bind_data.preserve_empty)) {
 				FlatVector::SetNull(target_vec, row_count, true);
 				continue;
 			}
@@ -791,8 +816,8 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			switch (type_id) {
 			case LogicalTypeId::VARCHAR: {
-				FlatVector::GetDataMutable<string_t>(vec)[row_count] =
-				    StringVector::AddString(vec, field.ptr, field.len);
+				FlatVector::GetDataMutable<string_t>(vec)[row_count] = StringVector::AddString(
+				    vec, field.ptr, bind_data.preserve_empty && SliceEquals(field, empty_field) ? 0 : field.len);
 				break;
 			}
 			case LogicalTypeId::DOUBLE: {
@@ -857,8 +882,11 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			}
 			case LogicalTypeId::LIST: {
 				auto &child_type = ListType::GetChildType(bind_data.column_types[schema_col]);
+				const auto &zeek_type = bind_data.header.types[schema_col];
+				const bool preserve_empty_strings =
+				    bind_data.preserve_empty && (zeek_type == "set[string]" || zeek_type == "vector[string]");
 				AppendListValue(context, lstate, vec, row_count, field, bind_data.header.set_separator, child_type,
-				                unset_field, empty_field);
+				                unset_field, empty_field, preserve_empty_strings);
 				break;
 			}
 			default: {
@@ -905,6 +933,7 @@ TableFunction GetZeekScanFunction() {
 		options.Add("filename", LogicalType::BOOLEAN)
 		    .Add("replace_periods", LogicalType::BOOLEAN)
 		    .Add("inet", LogicalType::BOOLEAN)
+		    .Add("preserve_empty", LogicalType::BOOLEAN)
 		    .Add("union_by_name", LogicalType::BOOLEAN)
 		    .Add("ignore_file_errors", LogicalType::BOOLEAN);
 	});

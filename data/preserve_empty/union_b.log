@@ -1,0 +1,7 @@
+#separator \x09
+#empty_field	(empty)
+#unset_field	-
+#fields	vs	id	extra
+#types	vector[string]	count	string
+(empty)	3	(empty)
+x,(empty),-	4	value
